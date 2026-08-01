@@ -1,6 +1,4 @@
 node_modules/
-.pi/npm/
-.pi/git/
-.pi/skills/
+.pi/
 *.log
 .DS_Store
