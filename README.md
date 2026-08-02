@@ -36,6 +36,9 @@ The `heishi` extension runs delegated subagents as normal interactive Pi session
 - `subagent_control` to prompt, steer, follow up, abort, focus, or resume a run
 - `subagent_wait` to wait for the current work to settle
 - `/subagent` to open the keyboard-driven management overlay
+- `/heishi model` to choose the model/thinking pairs the main agent may use for delegation and save them globally or for the current trusted project
+
+Project configuration in `.pi/heishi.json` overrides global configuration in `~/.pi/agent/heishi.json`; when no project file exists, Heishi falls back to the global pool. Delegation remains disabled until at least one currently authenticated pair is configured. Pi-scoped models constrain the picker when present; otherwise it lists all authenticated models.
 
 Each subagent keeps its own Pi session and loads project context files such as `AGENTS.md`. Multiple subagents may run concurrently in the same checkout, including concurrent writers, so callers are responsible for avoiding conflicting edits. Automatically delegated panes close after work settles; completed sessions remain resumable. Startup failures are recorded and returned with `status: "failed"` instead of failing the `subagent_start` tool call.
 

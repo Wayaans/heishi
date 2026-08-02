@@ -1,0 +1,103 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it } from "node:test";
+import type { Model } from "@earendil-works/pi-ai";
+import type { ScopedModel } from "@earendil-works/pi-coding-agent";
+import {
+  allowedPairs,
+  availableModelChoices,
+  loadEffectiveConfig,
+  saveConfig,
+  type DelegationConfig,
+  type ModelChoice,
+} from "./model-config.js";
+
+const globalConfig: DelegationConfig = {
+  models: [{ model: "provider/global", thinking: "high" }],
+};
+const projectConfig: DelegationConfig = {
+  models: [{ model: "provider/project", thinking: "medium" }],
+};
+
+describe("Heishi delegation model configuration", () => {
+  it("uses a trusted project configuration as a full override", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-config-"));
+    try {
+      const globalPath = join(root, "global.json");
+      const projectPath = join(root, "project", "heishi.json");
+      await saveConfig(globalPath, globalConfig);
+      await saveConfig(projectPath, projectConfig);
+
+      assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, true)).config, projectConfig);
+      assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, false)).config, globalConfig);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to global configuration when a trusted project has no file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-config-"));
+    try {
+      const globalPath = join(root, "global.json");
+      await saveConfig(globalPath, globalConfig);
+
+      const loaded = await loadEffectiveConfig(globalPath, join(root, "missing.json"), true);
+      assert.deepEqual(loaded.config, globalConfig);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("only permits configured pairs that remain available and supported", () => {
+    const choices: ModelChoice[] = [{ model: model("provider", "allowed"), levels: ["off", "high"] }];
+    const config: DelegationConfig = {
+      models: [
+        { model: "provider/allowed", thinking: "high" },
+        { model: "provider/allowed", thinking: "max" },
+        { model: "provider/missing", thinking: "off" },
+      ],
+    };
+
+    assert.deepEqual(allowedPairs(config, choices), [
+      { model: "provider/allowed", thinking: "high" },
+    ]);
+  });
+
+  it("uses authenticated models and honors scoped thinking pins", () => {
+    const authenticated = model("provider", "authenticated");
+    const unavailable = model("provider", "unavailable");
+    const scope: ScopedModel[] = [
+      { model: authenticated, thinkingLevel: "high" },
+      { model: unavailable, thinkingLevel: "high" },
+    ];
+
+    const choices = availableModelChoices([authenticated], scope);
+    assert.equal(choices.length, 1);
+    assert.equal(choices[0]?.model.id, "authenticated");
+    assert.deepEqual(choices[0]?.levels, ["high"]);
+  });
+
+  it("omits scoped thinking pins the model cannot execute", () => {
+    const nonReasoning = { ...model("provider", "plain"), reasoning: false };
+    const scope: ScopedModel[] = [{ model: nonReasoning, thinkingLevel: "high" }];
+
+    assert.deepEqual(availableModelChoices([nonReasoning], scope), []);
+  });
+});
+
+function model(provider: string, id: string): Model<any> {
+  return {
+    provider,
+    id,
+    name: id,
+    api: "openai-responses",
+    baseUrl: "https://example.test",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 16_384,
+  };
+}

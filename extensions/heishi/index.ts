@@ -1,5 +1,8 @@
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CONFIG_DIR_NAME,
+  getAgentDir,
   getMarkdownTheme,
   type ExtensionAPI,
   type ExtensionContext,
@@ -9,6 +12,16 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { RunCoordinator } from "./coordinator.js";
 import { IpcHub } from "./ipc.js";
+import {
+  allowedPairs,
+  availableModelChoices,
+  loadConfig,
+  loadEffectiveConfig,
+  saveConfig,
+  type DelegationConfig,
+  type DelegationPair,
+} from "./model-config.js";
+import { pickDelegationPairs } from "./model-picker.js";
 import { showSubagentOverlay } from "./overlay.js";
 import { reconcileRuns, restoreRunSnapshots, RUN_ENTRY_TYPE } from "./registry.js";
 import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
@@ -36,6 +49,8 @@ export default function heishi(pi: ExtensionAPI): void {
   const ipc = new IpcHub();
   const extensionPath = fileURLToPath(import.meta.url);
   let coordinator: RunCoordinator | undefined;
+  let delegationConfig: DelegationConfig = { models: [] };
+  let delegationConfigError: string | undefined;
 
   const createCoordinator = (ctx: ExtensionContext): RunCoordinator => new RunCoordinator({
     cwd: ctx.cwd,
@@ -54,6 +69,15 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     if (coordinator) await coordinator.shutdown();
     coordinator = createCoordinator(ctx);
+    const loaded = await loadEffectiveConfig(
+      join(getAgentDir(), "heishi.json"),
+      join(ctx.cwd, CONFIG_DIR_NAME, "heishi.json"),
+      ctx.isProjectTrusted(),
+    );
+    delegationConfig = loaded.config;
+    delegationConfigError = loaded.error;
+    if (loaded.error) ctx.ui.notify(loaded.error, "warning");
+
     const restored = restoreRunSnapshots(ctx.sessionManager.getBranch());
     const reconciled = await reconcileRuns(restored, tmux);
     coordinator.restore(reconciled);
@@ -79,6 +103,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session, live steering, or later session resume.",
       "Give `subagent_start` a self-contained task because the subagent does not receive the parent conversation.",
       "Always provide `subagent_start` an explicit model in `provider/model` form and an explicit thinking level; there are no defaults or silent fallbacks.",
+      "Choose the `subagent_start` model and thinking level only from the Heishi delegation pool included in the system prompt.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
       "After `subagent_start` returns, use `subagent_control` for live interaction and `subagent_wait` for the settled structured report.",
@@ -93,7 +118,15 @@ export default function heishi(pi: ExtensionAPI): void {
         { description: "Where to open the worker; defaults to a detached tmux window" },
       )),
     }),
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const pairs = effectivePairs(ctx);
+      if (pairs.length === 0) {
+        throw new Error(delegationConfigError ?? "Heishi delegation models are not configured; use /heishi model");
+      }
+      if (!pairs.some((pair) => pair.model === params.model && pair.thinking === params.thinking)) {
+        throw new Error(`Subagent model/thinking pair is not allowed: ${params.model} / ${params.thinking}`);
+      }
+
       const input: StartInput = {
         task: params.task,
         model: params.model,
@@ -145,9 +178,15 @@ export default function heishi(pi: ExtensionAPI): void {
       ], { description: "Control action to perform on the subagent run" }),
       message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort, focus, and resume" })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input: ControlInput = { runId: params.runId, action: params.action };
       if (params.message !== undefined) input.message = params.message;
+      if (params.action === "prompt" || params.action === "follow_up" || params.action === "resume") {
+        const run = requireCoordinator().list().find((candidate) => candidate.runId === params.runId);
+        if (run && !effectivePairs(ctx).some((pair) => pair.model === run.model && pair.thinking === run.thinking)) {
+          throw new Error(`Subagent model/thinking pair is no longer allowed: ${run.model} / ${run.thinking}`);
+        }
+      }
       return toolResult(await requireCoordinator().control(input));
     },
     renderCall(args, theme) {
@@ -196,6 +235,58 @@ export default function heishi(pi: ExtensionAPI): void {
     },
   });
 
+  pi.on("before_agent_start", (event, ctx) => {
+    const pairs = effectivePairs(ctx);
+    const guidance = pairs.length === 0
+      ? "Heishi subagent delegation is disabled. Do not call subagent_start or use subagent_control to resume or assign new work. The user can configure it with /heishi model."
+      : [
+          "Heishi subagent delegation must use one of these exact model/thinking pairs:",
+          ...pairs.map((pair) => `- ${pair.model} / ${pair.thinking}`),
+          "Choose the pair that best fits each delegated task and pass both values explicitly to subagent_start. Do not resume or assign new work to an existing subagent whose pair is not listed.",
+        ].join("\n");
+    return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
+  });
+
+  pi.registerCommand("heishi", {
+    description: "Configure Heishi",
+    handler: async (args, ctx) => {
+      if (args.trim() !== "model") {
+        ctx.ui.notify("Usage: /heishi model", "info");
+        return;
+      }
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/heishi model requires the interactive TUI", "warning");
+        return;
+      }
+
+      await ctx.modelRegistry.refresh();
+      const scopes = ctx.isProjectTrusted() ? ["Global", "Current project"] : ["Global"];
+      const scope = await ctx.ui.select("Save Heishi delegation models to", scopes);
+      if (!scope) return;
+
+      const globalPath = join(getAgentDir(), "heishi.json");
+      const projectPath = join(ctx.cwd, CONFIG_DIR_NAME, "heishi.json");
+      const path = scope === "Current project" ? projectPath : globalPath;
+      let initial = await loadConfig(path);
+      if (scope === "Current project" && !initial.exists) initial = await loadConfig(globalPath);
+      if (initial.error) ctx.ui.notify(initial.error, "warning");
+
+      const choices = availableModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels);
+      if (choices.length === 0) {
+        ctx.ui.notify("No authenticated models are available", "warning");
+        return;
+      }
+      const selected = await pickDelegationPairs(ctx, choices, initial.config.models);
+      if (!selected) return;
+
+      await saveConfig(path, { models: selected });
+      const loaded = await loadEffectiveConfig(globalPath, projectPath, ctx.isProjectTrusted());
+      delegationConfig = loaded.config;
+      delegationConfigError = loaded.error;
+      ctx.ui.notify(`Saved ${selected.length} Heishi delegation pair${selected.length === 1 ? "" : "s"} to ${path}`, "info");
+    },
+  });
+
   pi.registerCommand("subagent", {
     description: "Manage subagents in the current session",
     handler: async (_args, ctx) => {
@@ -206,6 +297,13 @@ export default function heishi(pi: ExtensionAPI): void {
       await showSubagentOverlay(requireCoordinator(), ctx);
     },
   });
+
+  function effectivePairs(ctx: ExtensionContext): DelegationPair[] {
+    return allowedPairs(
+      delegationConfig,
+      availableModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels),
+    );
+  }
 }
 
 interface RenderableResult {
