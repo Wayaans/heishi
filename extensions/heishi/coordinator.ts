@@ -1,6 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
-import type { LeaseHandle } from "./lease.js";
 import type { ProtocolEnvelope } from "./protocol.js";
 import { isActive } from "./registry.js";
 import { buildPiCommand, type ThinkingLevel, type TmuxAdapter } from "./tmux.js";
@@ -18,17 +17,12 @@ const MYTHOLOGICAL_NAMES = [
   "Hector", "Icarus", "Medea", "Odysseus", "Orpheus", "Perseus", "Theseus",
 ] as const;
 
-export interface LeaseAdapter {
-  acquire(cwd: string, runId: string): Promise<LeaseHandle>;
-}
-
 export interface CoordinatorDependencies {
   cwd: string;
   extensionPath: string;
   piPath: string;
   tmux: TmuxAdapter;
   ipc: IpcAdapter;
-  lease: LeaseAdapter;
   persist(record: RunRecord): void;
   newRunId?: () => string;
   newToken?: () => string;
@@ -43,7 +37,6 @@ interface Deferred {
 
 interface Runtime {
   channel: WorkerChannel;
-  lease: LeaseHandle;
   settled: Deferred;
   autoClose: boolean;
   finishing: boolean;
@@ -72,7 +65,6 @@ export class RunCoordinator {
 
   async start(input: StartInput, signal?: AbortSignal): Promise<RunResult> {
     validateStart(input);
-    await this.dependencies.tmux.validate();
     if (signal?.aborted) throw new Error("Subagent start was cancelled");
 
     const runId = this.newRunId();
@@ -85,7 +77,7 @@ export class RunCoordinator {
       cwd: this.dependencies.cwd,
       model: input.model,
       thinking: input.thinking,
-      placement: input.placement ?? "pane",
+      placement: input.placement ?? "window",
       status: "created",
       paneState: "closed",
       createdAt: timestamp,
@@ -95,10 +87,8 @@ export class RunCoordinator {
     this.persist(run);
 
     let abortListener: (() => void) | undefined;
-    let acquiredLease: LeaseHandle | undefined;
     try {
-      const lease = await this.dependencies.lease.acquire(run.cwd, runId);
-      acquiredLease = lease;
+      await this.dependencies.tmux.validate();
       throwIfAborted(signal);
       this.update(run, { status: "starting" });
       const token = this.newToken();
@@ -109,7 +99,6 @@ export class RunCoordinator {
       );
       const runtime: Runtime = {
         channel,
-        lease,
         settled: deferred(),
         autoClose: true,
         finishing: false,
@@ -140,22 +129,18 @@ export class RunCoordinator {
       const hasRuntime = this.runtimes.has(runId);
       if (signal?.aborted) {
         if (hasRuntime) await this.abortRun(runId);
-        else {
-          await acquiredLease?.release().catch(() => undefined);
-          if (isActive(run.status)) {
-            this.update(run, {
-              status: "cancelled",
-              paneState: "closed",
-              completedAt: this.now(),
-              error: "Subagent start was cancelled",
-            });
-          }
+        else if (isActive(run.status)) {
+          this.update(run, {
+            status: "cancelled",
+            paneState: "closed",
+            completedAt: this.now(),
+            error: "Subagent start was cancelled",
+          });
         }
         throw new Error("Subagent start was cancelled");
       }
       await this.failStartup(run, error);
-      if (!hasRuntime) await acquiredLease?.release().catch(() => undefined);
-      throw error;
+      return resultFromRun(run);
     } finally {
       if (signal && abortListener) signal.removeEventListener("abort", abortListener);
     }
@@ -225,10 +210,6 @@ export class RunCoordinator {
     for (const run of runs) this.runs.set(run.runId, structuredClone(run));
   }
 
-  hasMutationLease(): boolean {
-    return this.runtimes.size > 0;
-  }
-
   async shutdown(): Promise<void> {
     await Promise.all([...this.runtimes.keys()].map((runId) => this.abortRun(runId)));
   }
@@ -239,7 +220,6 @@ export class RunCoordinator {
       throw new Error("Subagent has no persisted worker session to resume");
     }
     await this.dependencies.tmux.validate();
-    const lease = await this.dependencies.lease.acquire(run.cwd, run.runId);
     const token = this.newToken();
     try {
       const channel = await this.dependencies.ipc.open(
@@ -249,7 +229,6 @@ export class RunCoordinator {
       );
       const runtime: Runtime = {
         channel,
-        lease,
         settled: resolvedDeferred(),
         autoClose: false,
         finishing: false,
@@ -266,7 +245,6 @@ export class RunCoordinator {
     } catch (error) {
       const runtime = this.runtimes.get(run.runId);
       await runtime?.channel.close().catch(() => undefined);
-      await lease.release();
       this.runtimes.delete(run.runId);
       if (run.tmuxTarget) await this.dependencies.tmux.close(run.tmuxTarget).catch(() => undefined);
       this.update(run, { paneState: "closed", error: errorMessage(error) });
@@ -297,7 +275,6 @@ export class RunCoordinator {
       environment: workerEnvironment(run.runId, token, runtime.channel.socketPath, resume),
     });
     this.update(run, { paneState: "open", tmuxTarget: target });
-    await runtime.lease.setTmuxTarget(target);
   }
 
   private async handleWorkerEvent(runId: string, event: ProtocolEnvelope): Promise<void> {
@@ -384,7 +361,6 @@ export class RunCoordinator {
     this.update(run, changes);
     await runtime.channel.close().catch(() => undefined);
     if (closePane && run.tmuxTarget) await this.dependencies.tmux.close(run.tmuxTarget).catch(() => undefined);
-    await runtime.lease.release().catch(() => undefined);
     this.runtimes.delete(run.runId);
     runtime.settled.resolve();
   }
@@ -394,7 +370,6 @@ export class RunCoordinator {
     if (runtime) {
       runtime.finishing = true;
       await runtime.channel.close().catch(() => undefined);
-      await runtime.lease.release().catch(() => undefined);
       runtime.settled.resolve();
       this.runtimes.delete(run.runId);
     }

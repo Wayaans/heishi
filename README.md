@@ -32,11 +32,11 @@ The project-local `.pi/settings.json` loads this repository as a pi package. Aft
 
 The `heishi` extension runs delegated subagents as normal interactive Pi sessions in tmux. Start Pi inside tmux, then use:
 
-- `subagent_start` with an explicit task, model, and thinking level
+- `subagent_start` with an explicit task, model, and thinking level; it opens in a detached tmux window by default, while `placement: "pane"` remains available
 - `subagent_control` to prompt, steer, follow up, abort, focus, or resume a run
 - `subagent_wait` to wait for the current work to settle
 - `/subagent` to open the keyboard-driven management overlay
 
-Each subagent keeps its own Pi session and loads project context files such as `AGENTS.md`. Automatically delegated panes close after work settles; completed sessions remain resumable.
+Each subagent keeps its own Pi session and loads project context files such as `AGENTS.md`. Multiple subagents may run concurrently in the same checkout, including concurrent writers, so callers are responsible for avoiding conflicting edits. Automatically delegated panes close after work settles; completed sessions remain resumable. Startup failures are recorded and returned with `status: "failed"` instead of failing the `subagent_start` tool call.
 
 Runtime third-party packages belong in `dependencies`. Keep pi-provided packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-tui`, and `typebox`) as `peerDependencies` with a `"*"` range.

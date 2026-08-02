@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { RunCoordinator, type CoordinatorDependencies } from "./coordinator.js";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
-import type { LeaseHandle } from "./lease.js";
 import type { ProtocolEnvelope } from "./protocol.js";
 import type { TmuxAdapter, TmuxLaunch } from "./tmux.js";
 import type { RunRecord } from "./types.js";
@@ -37,7 +36,7 @@ class FakeTmux implements TmuxAdapter {
   launches: TmuxLaunch[] = [];
   closed: string[] = [];
   async validate(): Promise<void> { this.validated = true; }
-  async launch(spec: TmuxLaunch): Promise<string> { this.launches.push(spec); return "%9"; }
+  async launch(spec: TmuxLaunch): Promise<string> { this.launches.push(spec); return `%${8 + this.launches.length}`; }
   async exists(): Promise<boolean> { return true; }
   async focus(): Promise<void> {}
   async close(target: string): Promise<void> { this.closed.push(target); }
@@ -48,7 +47,6 @@ function fixture(ready: Partial<WorkerReady> = {}): {
   ipc: FakeIpc;
   tmux: FakeTmux;
   records: RunRecord[];
-  released: { value: boolean };
 } {
   const channel = new FakeChannel({
     model: "openai/model",
@@ -60,20 +58,17 @@ function fixture(ready: Partial<WorkerReady> = {}): {
   const ipc = new FakeIpc(channel);
   const tmux = new FakeTmux();
   const records: RunRecord[] = [];
-  const released = { value: false };
-  const lease: LeaseHandle = {
-    setTmuxTarget: async () => undefined,
-    release: async () => { released.value = true; },
-  };
+  let runNumber = 0;
   const dependencies: CoordinatorDependencies = {
     cwd: "/repo",
     extensionPath: "/repo/extensions/heishi/index.ts",
     piPath: "/bin/pi",
     tmux,
     ipc,
-    lease: { acquire: async () => lease },
     persist: (record) => { records.push(structuredClone(record)); },
-    newRunId: () => "12345678-1234-1234-1234-123456789abc",
+    newRunId: () => runNumber++ === 0
+      ? "12345678-1234-1234-1234-123456789abc"
+      : "abcdefab-1234-1234-1234-123456789abc",
     newToken: () => "token",
     chooseAlias: () => "Atalanta",
     now: (() => {
@@ -81,7 +76,7 @@ function fixture(ready: Partial<WorkerReady> = {}): {
       return () => new Date(1_700_000_000_000 + tick++ * 1000).toISOString();
     })(),
   };
-  return { coordinator: new RunCoordinator(dependencies), ipc, tmux, records, released };
+  return { coordinator: new RunCoordinator(dependencies), ipc, tmux, records };
 }
 
 function completedRun(): RunRecord {
@@ -105,13 +100,14 @@ function completedRun(): RunRecord {
 
 describe("run coordinator", () => {
   it("starts asynchronously only after verified readiness, then closes on agent_settled", async () => {
-    const { coordinator, ipc, tmux, released } = fixture();
+    const { coordinator, ipc, tmux } = fixture();
     const started = await coordinator.start({ task: "Inspect the repository", model: "openai/model", thinking: "high" });
 
     assert.equal(tmux.validated, true);
     assert.equal(started.status, "running");
     assert.equal(started.alias, "Atalanta");
     assert.equal(started.tmuxTarget, "%9");
+    assert.equal(tmux.launches[0]?.placement, "window");
     assert.deepEqual((ipc.channel).sent[0], { type: "task", payload: { task: "Inspect the repository" } });
     assert.equal(tmux.launches[0]?.command.includes("--no-context-files"), false);
     assert.equal(tmux.launches[0]?.command.includes("--no-session"), false);
@@ -126,7 +122,6 @@ describe("run coordinator", () => {
     assert.equal(completed.status, "completed");
     assert.equal(completed.report?.summary, "Done");
     assert.deepEqual(tmux.closed, ["%9"]);
-    assert.equal(released.value, true);
   });
 
   it("cancels startup without overwriting the terminal status", async () => {
@@ -149,15 +144,14 @@ describe("run coordinator", () => {
     assert.deepEqual(tmux.closed, ["%9"]);
   });
 
-  it("fails startup when Pi changes the requested model or thinking level", async () => {
-    const { coordinator, tmux, released } = fixture({ model: "openai/fallback" });
+  it("returns a failed run when Pi changes the requested model or thinking level", async () => {
+    const { coordinator, tmux } = fixture({ model: "openai/fallback" });
 
-    await assert.rejects(
-      () => coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" }),
-      /requested model openai\/model.*openai\/fallback/,
-    );
+    const failed = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /requested model openai\/model.*openai\/fallback/);
     assert.deepEqual(tmux.closed, ["%9"]);
-    assert.equal(released.value, true);
     assert.equal(coordinator.list()[0]?.workerSessionFile, "/sessions/session-1.jsonl");
   });
 
@@ -179,6 +173,21 @@ describe("run coordinator", () => {
     releaseSend();
     await assert.rejects(starting, /cancelled/);
     assert.equal(coordinator.list()[0]?.status, "failed");
+  });
+
+  it("starts multiple runs concurrently", async () => {
+    const { coordinator, tmux } = fixture();
+
+    const [first, second] = await Promise.all([
+      coordinator.start({ task: "Inspect structure", model: "openai/model", thinking: "high" }),
+      coordinator.start({ task: "Inspect package", model: "openai/model", thinking: "high" }),
+    ]);
+
+    assert.equal(first.status, "running");
+    assert.equal(second.status, "running");
+    assert.notEqual(first.runId, second.runId);
+    assert.deepEqual(tmux.launches.map((launch) => launch.placement), ["window", "window"]);
+    await coordinator.shutdown();
   });
 
   it("keeps existing waiters attached when a follow-up is queued", async () => {
@@ -244,7 +253,7 @@ describe("run coordinator", () => {
   });
 
   it("resumes the persisted session without replaying the original task", async () => {
-    const { coordinator, ipc, tmux, released } = fixture();
+    const { coordinator, ipc, tmux } = fixture();
     coordinator.restore([completedRun()]);
 
     const resumed = await coordinator.control({ runId: "run-1", action: "resume" });
@@ -255,7 +264,6 @@ describe("run coordinator", () => {
 
     await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Inspected" });
     assert.deepEqual(tmux.closed, []);
-    assert.equal(released.value, false);
     await coordinator.shutdown();
   });
 });
