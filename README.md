@@ -33,7 +33,7 @@ The project-local `.pi/settings.json` loads this repository as a pi package. Aft
 The `heishi` extension runs delegated subagents as normal interactive Pi sessions in tmux. Start Pi inside tmux, then use:
 
 - `subagent_start` with an explicit task, model, and thinking level; it opens in a detached tmux window by default, while `placement: "pane"` remains available
-- `subagent_control` to prompt, steer, follow up, or abort a run
+- `subagent_control` to prompt, steer, follow up, abort, or resume a run
 - `subagent_wait` to wait for the current work to settle
 - `/subagent` to open the keyboard-driven management overlay
 - `/heishi model` to choose the model/thinking pairs the main agent may use for delegation and save them globally or for the current trusted project

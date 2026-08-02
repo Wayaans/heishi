@@ -159,12 +159,13 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_control",
     label: "Control Subagent",
-    description: "Prompt, steer, follow up, or abort a persistent subagent by its authoritative run UUID.",
-    promptSnippet: "Prompt, steer, follow up, or abort a tmux subagent run",
+    description: "Prompt, steer, follow up, abort, or resume a persistent subagent by its authoritative run UUID.",
+    promptSnippet: "Prompt, steer, follow up, abort, or resume a tmux subagent run",
     promptGuidelines: [
       "Use `subagent_control` with the full authoritative run UUID returned by `subagent_start`; aliases are display-only.",
       "Include `message` when using `subagent_control` actions `prompt`, `steer`, or `follow_up`.",
       "Use `subagent_control` action `steer` during active work, `follow_up` to queue work after the current turn, and `prompt` to start new work while idle.",
+      "Use `resume` only to reconnect a disconnected subagent before another control action.",
     ],
     parameters: Type.Object({
       runId: Type.String({ description: "Full authoritative run UUID returned by subagent_start" }),
@@ -173,13 +174,14 @@ export default function heishi(pi: ExtensionAPI): void {
         Type.Literal("steer"),
         Type.Literal("follow_up"),
         Type.Literal("abort"),
+        Type.Literal("resume"),
       ], { description: "Control action to perform on the subagent run" }),
-      message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort" })),
+      message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort and resume" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input: ControlInput = { runId: params.runId, action: params.action };
       if (params.message !== undefined) input.message = params.message;
-      if (params.action === "prompt" || params.action === "follow_up") {
+      if (params.action === "prompt" || params.action === "follow_up" || params.action === "resume") {
         const run = requireCoordinator().list().find((candidate) => candidate.runId === params.runId);
         if (run && !effectivePairs(ctx).some((pair) => pair.model === run.model && pair.thinking === run.thinking)) {
           throw new Error(`Subagent model/thinking pair is no longer allowed: ${run.model} / ${run.thinking}`);
@@ -236,11 +238,11 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event, ctx) => {
     const pairs = effectivePairs(ctx);
     const guidance = pairs.length === 0
-      ? "Heishi subagent delegation is disabled. Do not call subagent_start or use subagent_control to assign new work. The user can configure it with /heishi model."
+      ? "Heishi subagent delegation is disabled. Do not call subagent_start or use subagent_control to resume or assign new work. The user can configure it with /heishi model."
       : [
           "Heishi subagent delegation must use one of these exact model/thinking pairs:",
           ...pairs.map((pair) => `- ${pair.model} / ${pair.thinking}`),
-          "Choose the pair that best fits each delegated task and pass both values explicitly to subagent_start. Do not assign new work to an existing subagent whose pair is not listed.",
+          "Choose the pair that best fits each delegated task and pass both values explicitly to subagent_start. Do not resume or assign new work to an existing subagent whose pair is not listed.",
         ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
   });

@@ -44,7 +44,7 @@ describe("Heishi tool prompt metadata", () => {
     assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping work") && guideline.includes("worktrees")));
     assert.deepEqual(
       control.parameters.properties?.["action"]?.anyOf?.map((action) => action.const),
-      ["prompt", "steer", "follow_up", "abort"],
+      ["prompt", "steer", "follow_up", "abort", "resume"],
     );
   });
 });
