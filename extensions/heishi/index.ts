@@ -100,7 +100,7 @@ export default function heishi(pi: ExtensionAPI): void {
     description: "Start an asynchronous persistent subagent in an interactive tmux session. The subagent does not receive the parent conversation, so provide a self-contained task plus an explicit model and thinking level.",
     promptSnippet: "Start persistent interactive tmux subagents for delegated work",
     promptGuidelines: [
-      "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session, live steering, or later session resume.",
+      "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
       "Give `subagent_start` a self-contained task because the subagent does not receive the parent conversation.",
       "Always provide `subagent_start` an explicit model in `provider/model` form and an explicit thinking level; there are no defaults or silent fallbacks.",
       "Choose the `subagent_start` model and thinking level only from the Heishi delegation pool included in the system prompt.",
@@ -159,8 +159,8 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_control",
     label: "Control Subagent",
-    description: "Prompt, steer, follow up, abort, focus, or resume a persistent subagent by its authoritative run UUID.",
-    promptSnippet: "Prompt, steer, follow up, abort, focus, or resume a tmux subagent run",
+    description: "Prompt, steer, follow up, or abort a persistent subagent by its authoritative run UUID.",
+    promptSnippet: "Prompt, steer, follow up, or abort a tmux subagent run",
     promptGuidelines: [
       "Use `subagent_control` with the full authoritative run UUID returned by `subagent_start`; aliases are display-only.",
       "Include `message` when using `subagent_control` actions `prompt`, `steer`, or `follow_up`.",
@@ -173,15 +173,13 @@ export default function heishi(pi: ExtensionAPI): void {
         Type.Literal("steer"),
         Type.Literal("follow_up"),
         Type.Literal("abort"),
-        Type.Literal("focus"),
-        Type.Literal("resume"),
       ], { description: "Control action to perform on the subagent run" }),
-      message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort, focus, and resume" })),
+      message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input: ControlInput = { runId: params.runId, action: params.action };
       if (params.message !== undefined) input.message = params.message;
-      if (params.action === "prompt" || params.action === "follow_up" || params.action === "resume") {
+      if (params.action === "prompt" || params.action === "follow_up") {
         const run = requireCoordinator().list().find((candidate) => candidate.runId === params.runId);
         if (run && !effectivePairs(ctx).some((pair) => pair.model === run.model && pair.thinking === run.thinking)) {
           throw new Error(`Subagent model/thinking pair is no longer allowed: ${run.model} / ${run.thinking}`);
@@ -238,11 +236,11 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event, ctx) => {
     const pairs = effectivePairs(ctx);
     const guidance = pairs.length === 0
-      ? "Heishi subagent delegation is disabled. Do not call subagent_start or use subagent_control to resume or assign new work. The user can configure it with /heishi model."
+      ? "Heishi subagent delegation is disabled. Do not call subagent_start or use subagent_control to assign new work. The user can configure it with /heishi model."
       : [
           "Heishi subagent delegation must use one of these exact model/thinking pairs:",
           ...pairs.map((pair) => `- ${pair.model} / ${pair.thinking}`),
-          "Choose the pair that best fits each delegated task and pass both values explicitly to subagent_start. Do not resume or assign new work to an existing subagent whose pair is not listed.",
+          "Choose the pair that best fits each delegated task and pass both values explicitly to subagent_start. Do not assign new work to an existing subagent whose pair is not listed.",
         ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
   });

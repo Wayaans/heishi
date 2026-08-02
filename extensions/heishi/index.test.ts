@@ -8,7 +8,10 @@ interface RegisteredTool {
   promptSnippet?: string;
   promptGuidelines?: string[];
   parameters: {
-    properties?: Record<string, { description?: string }>;
+    properties?: Record<string, {
+      description?: string;
+      anyOf?: Array<{ const?: string }>;
+    }>;
   };
 }
 
@@ -39,6 +42,10 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("concurrently");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping work") && guideline.includes("worktrees")));
+    assert.deepEqual(
+      control.parameters.properties?.["action"]?.anyOf?.map((action) => action.const),
+      ["prompt", "steer", "follow_up", "abort"],
+    );
   });
 });
 
