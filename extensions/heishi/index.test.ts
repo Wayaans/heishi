@@ -48,9 +48,42 @@ describe("Heishi tool prompt metadata", () => {
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping work") && guideline.includes("worktrees")));
     assert.deepEqual(
+      start.parameters.properties?.["placement"]?.anyOf?.map((placement) => placement.const),
+      ["pane", "window", "session"],
+    );
+    assert.deepEqual(
       control.parameters.properties?.["action"]?.anyOf?.map((action) => action.const),
       ["prompt", "steer", "follow_up", "abort", "resume"],
     );
+  });
+
+  it("renders the run duration at the end of a settled result", () => {
+    const tools: RegisteredTool[] = [];
+    const pi = {
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI;
+    heishi(pi);
+
+    const renderResult = requireTool(tools, "subagent_wait").renderResult;
+    assert.ok(renderResult);
+    const rendered = renderResult({
+      content: [],
+      details: {
+        runId: "12345678-1234-1234-1234-123456789abc",
+        alias: "Atalanta",
+        status: "completed",
+        model: "openai/model",
+        thinking: "high",
+        durationMs: 83_000,
+      },
+    }, {}, {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    }).render(200).join("\n").trimEnd();
+
+    assert.match(rendered, /Duration: 1m 23s$/u);
   });
 
   it("renders running location metadata without repeating model and thinking", () => {

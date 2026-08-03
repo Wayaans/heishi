@@ -26,7 +26,7 @@ import { showSubagentOverlay } from "./overlay.js";
 import { reconcileRuns, restoreRunSnapshots, RUN_ENTRY_TYPE } from "./registry.js";
 import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
 import { Tmux } from "./tmux.js";
-import type { ControlInput, RunResult, StartInput } from "./types.js";
+import type { ControlInput, RunResult, StartInput, WaitResult } from "./types.js";
 import { registerWorkerBridge } from "./worker.js";
 
 const ThinkingSchema = Type.Union([
@@ -114,8 +114,8 @@ export default function heishi(pi: ExtensionAPI): void {
       model: Type.String({ description: "Required model in provider/model form, for example openai-codex/gpt-5.6-sol" }),
       thinking: ThinkingSchema,
       placement: Type.Optional(Type.Union(
-        [Type.Literal("pane"), Type.Literal("window")],
-        { description: "Where to open the worker; defaults to a detached tmux window" },
+        [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
+        { description: "Where to open the worker; defaults to detached windows in the named heishi-subagents tmux session" },
       )),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -203,7 +203,7 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_wait",
     label: "Wait for Subagent",
-    description: "Wait until a subagent's current delegated work reaches agent_settled, then return its structured report and verified session metadata.",
+    description: "Wait until a subagent's current delegated work reaches agent_settled, then return its structured report, verified session metadata, and run duration.",
     promptSnippet: "Wait for a tmux subagent to settle and return its structured report",
     promptGuidelines: [
       "Use `subagent_wait` with the full run UUID after starting or controlling a subagent when the parent needs its final result.",
@@ -224,13 +224,23 @@ export default function heishi(pi: ExtensionAPI): void {
       );
     },
     renderResult(result, _options, theme) {
-      const details = result.details as RunResult | undefined;
+      const details = result.details as WaitResult | undefined;
       if (!details) return fallbackResult(result);
-      if (!details.report) return renderRunResult(details, result, theme);
       const container = new Container();
       container.addChild(new Text(runStatusHeader(details, theme), 0, 0));
+      if (details.report) {
+        container.addChild(new Spacer(1));
+        container.addChild(new Markdown(reportMarkdown(details.report), 0, 0, getMarkdownTheme()));
+      }
+      const seconds = Math.max(0, Math.floor(details.durationMs / 1000));
+      const minutes = Math.floor(seconds / 60);
+      const duration = seconds < 60
+        ? `${seconds}s`
+        : minutes < 60
+          ? `${minutes}m ${seconds % 60}s`
+          : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
       container.addChild(new Spacer(1));
-      container.addChild(new Markdown(reportMarkdown(details.report), 0, 0, getMarkdownTheme()));
+      container.addChild(new Text(theme.fg("dim", `Duration: ${duration}`), 0, 0));
       return container;
     },
   });

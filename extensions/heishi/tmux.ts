@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type Placement = "pane" | "window";
+export type Placement = "pane" | "window" | "session";
 
 export interface CommandExecutor {
   exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }>;
@@ -18,6 +18,7 @@ export class ProcessCommandExecutor implements CommandExecutor {
 
 export interface TmuxLaunch {
   placement: Placement;
+  sessionName?: string;
   cwd: string;
   title: string;
   command: string[];
@@ -61,13 +62,48 @@ export class Tmux implements TmuxAdapter {
 
   async launch(spec: TmuxLaunch): Promise<TmuxTarget> {
     if (spec.command.length === 0) throw new Error("Subagent command is empty");
-    const operation = spec.placement === "pane" ? "split-window" : "new-window";
-    const args = [operation, "-d", "-P", "-F", "#{pane_id} #{window_id} #{session_id}", "-c", spec.cwd];
-    if (spec.placement === "window") args.push("-n", spec.title);
-    for (const [key, value] of Object.entries(spec.environment)) args.push("-e", `${key}=${value}`);
-    args.push(`exec ${spec.command.map(shellQuote).join(" ")}`);
+    const format = "#{pane_id} #{window_id} #{session_id}";
+    const namedSessionArgs = (operation: "new-session" | "new-window", sessionName: string): string[] => {
+      return operation === "new-window"
+        ? [operation, "-d", "-P", "-F", format, "-t", `=${sessionName}:`, "-n", spec.title, "-c", spec.cwd]
+        : [operation, "-d", "-P", "-F", format, "-s", sessionName, "-n", spec.title, "-c", spec.cwd];
+    };
+    let args: string[];
+    if (spec.placement === "session") {
+      if (!spec.sessionName?.trim()) throw new Error("Named session placement requires a session name");
+      const sessionTarget = `=${spec.sessionName}`;
+      const exists = await this.executor.exec("tmux", ["has-session", "-t", sessionTarget])
+        .then(() => true, () => false);
+      args = namedSessionArgs(exists ? "new-window" : "new-session", spec.sessionName);
+    } else {
+      const operation = spec.placement === "pane" ? "split-window" : "new-window";
+      args = [operation, "-d", "-P", "-F", format, "-c", spec.cwd];
+      if (spec.placement === "window") args.push("-n", spec.title);
+    }
+    const completeArgs = (base: string[]): string[] => {
+      for (const [key, value] of Object.entries(spec.environment)) base.push("-e", `${key}=${value}`);
+      base.push(`exec ${spec.command.map(shellQuote).join(" ")}`);
+      return base;
+    };
+    args = completeArgs(args);
 
-    const result = await this.executor.exec("tmux", args);
+    let result: { stdout: string; stderr: string };
+    try {
+      result = await this.executor.exec("tmux", args);
+    } catch (error) {
+      if (spec.placement !== "session" || !spec.sessionName) throw error;
+      const sessionTarget = `=${spec.sessionName}`;
+      const exists = await this.executor.exec("tmux", ["has-session", "-t", sessionTarget])
+        .then(() => true, () => false);
+      const retryOperation = args[0] === "new-session" && exists
+        ? "new-window"
+        : args[0] === "new-window" && !exists
+          ? "new-session"
+          : undefined;
+      if (!retryOperation) throw error;
+      args = completeArgs(namedSessionArgs(retryOperation, spec.sessionName));
+      result = await this.executor.exec("tmux", args);
+    }
     const [paneId, windowId, sessionId] = result.stdout.trim().split(" ");
     if (!paneId?.startsWith("%") || !windowId?.startsWith("@") || !sessionId?.startsWith("$")) {
       throw new Error(`tmux did not return pane, window, and session IDs: ${result.stdout.trim()}`);

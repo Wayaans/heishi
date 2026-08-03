@@ -66,6 +66,10 @@ export interface RunResult {
   error?: string;
 }
 
+export interface WaitResult extends RunResult {
+  durationMs: number;
+}
+
 export function resultFromRun(run: RunRecord): RunResult {
   const result: RunResult = {
     runId: run.runId,

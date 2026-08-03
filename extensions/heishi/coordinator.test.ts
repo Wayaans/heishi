@@ -112,7 +112,8 @@ describe("run coordinator", () => {
     assert.equal(started.tmuxTarget, "%9");
     assert.equal(started.tmuxWindowId, "@2");
     assert.equal(started.tmuxSessionId, "$1");
-    assert.equal(tmux.launches[0]?.placement, "window");
+    assert.equal(tmux.launches[0]?.placement, "session");
+    assert.equal(tmux.launches[0]?.sessionName, "heishi-subagents");
     assert.deepEqual((ipc.channel).sent[0], { type: "task", payload: { task: "Inspect the repository" } });
     assert.equal(tmux.launches[0]?.command.includes("--no-context-files"), false);
     assert.equal(tmux.launches[0]?.command.includes("--no-session"), false);
@@ -126,6 +127,7 @@ describe("run coordinator", () => {
 
     assert.equal(completed.status, "completed");
     assert.equal(completed.report?.summary, "Done");
+    assert.equal(completed.durationMs, 3_000);
     assert.deepEqual(tmux.closed, ["%9"]);
   });
 
@@ -180,6 +182,21 @@ describe("run coordinator", () => {
     assert.equal(coordinator.list()[0]?.status, "failed");
   });
 
+  it("targets the fixed background session when session placement is requested", async () => {
+    const { coordinator, tmux } = fixture();
+
+    await coordinator.start({
+      task: "Inspect in the background",
+      model: "openai/model",
+      thinking: "high",
+      placement: "session",
+    });
+
+    assert.equal(tmux.launches[0]?.placement, "session");
+    assert.equal(tmux.launches[0]?.sessionName, "heishi-subagents");
+    await coordinator.shutdown();
+  });
+
   it("starts multiple runs concurrently", async () => {
     const { coordinator, tmux } = fixture();
 
@@ -191,7 +208,7 @@ describe("run coordinator", () => {
     assert.equal(first.status, "running");
     assert.equal(second.status, "running");
     assert.notEqual(first.runId, second.runId);
-    assert.deepEqual(tmux.launches.map((launch) => launch.placement), ["window", "window"]);
+    assert.deepEqual(tmux.launches.map((launch) => launch.placement), ["session", "session"]);
     await coordinator.shutdown();
   });
 

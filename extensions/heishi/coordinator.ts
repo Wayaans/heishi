@@ -10,7 +10,10 @@ import {
   type RunResult,
   type StartInput,
   type SubagentReport,
+  type WaitResult,
 } from "./types.js";
+
+const SUBAGENT_SESSION_NAME = "heishi-subagents";
 
 const MYTHOLOGICAL_NAMES = [
   "Achilles", "Andromeda", "Ariadne", "Atalanta", "Cassandra", "Circe", "Daedalus", "Electra",
@@ -77,7 +80,7 @@ export class RunCoordinator {
       cwd: this.dependencies.cwd,
       model: input.model,
       thinking: input.thinking,
-      placement: input.placement ?? "window",
+      placement: input.placement ?? "session",
       status: "created",
       paneState: "closed",
       createdAt: timestamp,
@@ -190,7 +193,7 @@ export class RunCoordinator {
     return resultFromRun(this.requireRun(run.runId));
   }
 
-  async wait(runId: string, signal?: AbortSignal): Promise<RunResult> {
+  async wait(runId: string, signal?: AbortSignal): Promise<WaitResult> {
     const run = this.requireRun(runId);
     const runtime = this.runtimes.get(runId);
     let abortListener: (() => void) | undefined;
@@ -200,7 +203,10 @@ export class RunCoordinator {
     }
     try {
       if (isActive(run.status) && runtime) await runtime.settled.promise;
-      return resultFromRun(this.requireRun(runId));
+      const settledRun = this.requireRun(runId);
+      const startedAt = Date.parse(settledRun.startedAt ?? settledRun.createdAt);
+      const endedAt = Date.parse(settledRun.completedAt ?? (isActive(settledRun.status) ? this.now() : settledRun.updatedAt));
+      return { ...resultFromRun(settledRun), durationMs: Math.max(0, endedAt - startedAt) };
     } finally {
       if (signal && abortListener) signal.removeEventListener("abort", abortListener);
     }
@@ -274,6 +280,7 @@ export class RunCoordinator {
     };
     const target = await this.dependencies.tmux.launch({
       placement: run.placement,
+      ...(run.placement === "session" ? { sessionName: SUBAGENT_SESSION_NAME } : {}),
       cwd: run.cwd,
       title,
       command: buildPiCommand(commandOptions),
