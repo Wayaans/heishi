@@ -1,5 +1,6 @@
 node_modules/
 .pi/npm/
+.pi/settings.json
 .pi/git/
 .pi/skills/
 *.log
