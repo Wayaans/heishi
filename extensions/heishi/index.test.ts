@@ -47,6 +47,15 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("concurrently");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping work") && guideline.includes("worktrees")));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("`placement` parameter is optional")
+        && guideline.includes("Omit it unless the user explicitly requests")
+        && guideline.includes("falls back to `session`");
+    }));
+    assert.match(
+      start.parameters.properties?.["placement"]?.description ?? "",
+      /Omit unless the user explicitly requests one; omission falls back to session/u,
+    );
     assert.deepEqual(
       start.parameters.properties?.["placement"]?.anyOf?.map((placement) => placement.const),
       ["pane", "window", "session"],

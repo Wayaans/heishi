@@ -103,6 +103,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
       "Give `subagent_start` a self-contained task because the subagent does not receive the parent conversation.",
       "Always provide `subagent_start` an explicit model in `provider/model` form and an explicit thinking level; there are no defaults or silent fallbacks.",
+      "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission falls back to `session`.",
       "Choose the `subagent_start` model and thinking level only from the Heishi delegation pool included in the system prompt.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
@@ -115,7 +116,7 @@ export default function heishi(pi: ExtensionAPI): void {
       thinking: ThinkingSchema,
       placement: Type.Optional(Type.Union(
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
-        { description: "Where to open the worker; defaults to detached windows in the named heishi-subagents tmux session" },
+        { description: "Optional worker placement. Omit unless the user explicitly requests one; omission falls back to session, which opens a detached window in the named heishi-subagents tmux session" },
       )),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
