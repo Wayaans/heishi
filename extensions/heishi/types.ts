@@ -23,6 +23,8 @@ export interface RunRecord {
   status: RunStatus;
   paneState: PaneState;
   tmuxTarget?: string;
+  tmuxWindowId?: string;
+  tmuxSessionId?: string;
   workerSessionId?: string;
   workerSessionFile?: string;
   createdAt: string;
@@ -54,6 +56,8 @@ export interface RunResult {
   alias: string;
   status: RunStatus;
   tmuxTarget?: string;
+  tmuxWindowId?: string;
+  tmuxSessionId?: string;
   workerSessionId?: string;
   workerSessionFile?: string;
   model: string;
@@ -71,6 +75,8 @@ export function resultFromRun(run: RunRecord): RunResult {
     thinking: run.thinking,
   };
   if (run.tmuxTarget !== undefined) result.tmuxTarget = run.tmuxTarget;
+  if (run.tmuxWindowId !== undefined) result.tmuxWindowId = run.tmuxWindowId;
+  if (run.tmuxSessionId !== undefined) result.tmuxSessionId = run.tmuxSessionId;
   if (run.workerSessionId !== undefined) result.workerSessionId = run.workerSessionId;
   if (run.workerSessionFile !== undefined) result.workerSessionFile = run.workerSessionFile;
   if (run.report !== undefined) result.report = run.report;

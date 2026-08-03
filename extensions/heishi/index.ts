@@ -328,10 +328,15 @@ function runStatusHeader(result: RunResult, theme: Theme): string {
       : result.status === "blocked" || result.status === "cancelled"
         ? "warning"
         : "accent";
-  const icon = result.status === "completed" ? "✓" : result.status === "failed" ? "✕" : result.status === "running" ? "◐" : "!";
-  const pane = result.tmuxTarget ? ` · pane ${result.tmuxTarget}` : "";
+  const icon = result.status === "completed" ? "✓" : result.status === "failed" ? "✕" : result.status === "running" ? "→" : "!";
+  const location = [
+    result.tmuxTarget ? `pane id ${result.tmuxTarget}` : undefined,
+    result.tmuxWindowId ? `window id ${result.tmuxWindowId}` : undefined,
+    result.tmuxSessionId ? `session id ${result.tmuxSessionId}` : undefined,
+  ].filter(Boolean).join(" · ");
+  const metadata = location ? ` · ${location}` : "";
   const error = result.error ? `\n  ${theme.fg("error", result.error)}` : "";
-  return `${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(runIdentity(result)))}  ${theme.fg(color, result.status)}${theme.fg("dim", `${pane} · ${result.model} / ${result.thinking}`)}${error}`;
+  return `${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(runIdentity(result)))}  ${theme.fg(color, result.status)}${theme.fg("dim", metadata)}${error}`;
 }
 
 function toolResult(

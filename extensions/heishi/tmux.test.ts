@@ -9,7 +9,7 @@ class FakeExecutor implements CommandExecutor {
   async exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
     this.calls.push({ command, args });
     if (this.failTitle && args[0] === "select-pane") throw new Error("title failed");
-    if (args[0] === "split-window" || args[0] === "new-window") return { stdout: "%17\n", stderr: "" };
+    if (args[0] === "split-window" || args[0] === "new-window") return { stdout: "%17 @3 $1\n", stderr: "" };
     return { stdout: "$1\n", stderr: "" };
   }
 }
@@ -35,11 +35,11 @@ describe("tmux adapter", () => {
       environment: { HEISHI_RUN_ID: "a1b2c3" },
     });
 
-    assert.equal(target, "%17");
+    assert.deepEqual(target, { paneId: "%17", windowId: "@3", sessionId: "$1" });
     const launch = executor.calls[0];
     assert.equal(launch?.command, "tmux");
     assert.deepEqual(launch?.args.slice(0, 8), [
-      "split-window", "-d", "-P", "-F", "#{pane_id}", "-c", "/work/repo", "-e",
+      "split-window", "-d", "-P", "-F", "#{pane_id} #{window_id} #{session_id}", "-c", "/work/repo", "-e",
     ]);
     assert.ok(launch?.args.includes("HEISHI_RUN_ID=a1b2c3"));
     const shellCommand = launch?.args.at(-1) ?? "";

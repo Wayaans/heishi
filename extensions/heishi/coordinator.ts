@@ -168,6 +168,8 @@ export class RunCoordinator {
     const startsWork = input.action === "prompt" || input.action === "follow_up";
     const previousRun = structuredClone(run);
     const previousSettled = runtime.settled;
+    const previousAutoClose = runtime.autoClose;
+    runtime.autoClose = true;
     if (startsWork) {
       if (!isActive(run.status)) runtime.settled = deferred();
       this.update(run, { status: "running", report: undefined, error: undefined, startedAt: this.now() });
@@ -175,10 +177,13 @@ export class RunCoordinator {
     try {
       await runtime.channel.send(input.action, { message: input.message as string });
     } catch (error) {
-      if (startsWork && this.runtimes.get(run.runId) === runtime) {
-        runtime.settled = previousSettled;
-        this.runs.set(run.runId, previousRun);
-        this.persist(previousRun);
+      if (this.runtimes.get(run.runId) === runtime) {
+        runtime.autoClose = previousAutoClose;
+        if (startsWork) {
+          runtime.settled = previousSettled;
+          this.runs.set(run.runId, previousRun);
+          this.persist(previousRun);
+        }
       }
       throw error;
     }
@@ -274,7 +279,12 @@ export class RunCoordinator {
       command: buildPiCommand(commandOptions),
       environment: workerEnvironment(run.runId, token, runtime.channel.socketPath, resume),
     });
-    this.update(run, { paneState: "open", tmuxTarget: target });
+    this.update(run, {
+      paneState: "open",
+      tmuxTarget: target.paneId,
+      tmuxWindowId: target.windowId,
+      tmuxSessionId: target.sessionId,
+    });
   }
 
   private async handleWorkerEvent(runId: string, event: ProtocolEnvelope): Promise<void> {

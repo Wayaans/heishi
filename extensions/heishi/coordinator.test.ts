@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { RunCoordinator, type CoordinatorDependencies } from "./coordinator.js";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
 import type { ProtocolEnvelope } from "./protocol.js";
-import type { TmuxAdapter, TmuxLaunch } from "./tmux.js";
+import type { TmuxAdapter, TmuxLaunch, TmuxTarget } from "./tmux.js";
 import type { RunRecord } from "./types.js";
 
 class FakeChannel implements WorkerChannel {
@@ -36,7 +36,10 @@ class FakeTmux implements TmuxAdapter {
   launches: TmuxLaunch[] = [];
   closed: string[] = [];
   async validate(): Promise<void> { this.validated = true; }
-  async launch(spec: TmuxLaunch): Promise<string> { this.launches.push(spec); return `%${8 + this.launches.length}`; }
+  async launch(spec: TmuxLaunch): Promise<TmuxTarget> {
+    this.launches.push(spec);
+    return { paneId: `%${8 + this.launches.length}`, windowId: "@2", sessionId: "$1" };
+  }
   async exists(): Promise<boolean> { return true; }
   async focus(): Promise<void> {}
   async close(target: string): Promise<void> { this.closed.push(target); }
@@ -107,6 +110,8 @@ describe("run coordinator", () => {
     assert.equal(started.status, "running");
     assert.equal(started.alias, "Atalanta");
     assert.equal(started.tmuxTarget, "%9");
+    assert.equal(started.tmuxWindowId, "@2");
+    assert.equal(started.tmuxSessionId, "$1");
     assert.equal(tmux.launches[0]?.placement, "window");
     assert.deepEqual((ipc.channel).sent[0], { type: "task", payload: { task: "Inspect the repository" } });
     assert.equal(tmux.launches[0]?.command.includes("--no-context-files"), false);
@@ -216,8 +221,8 @@ describe("run coordinator", () => {
     assert.equal((await aborting).status, "cancelled");
   });
 
-  it("marks a terminal run active before sending a new follow-up", async () => {
-    const { coordinator, ipc } = fixture();
+  it("marks a terminal run active and auto-closes its resumed pane after a follow-up", async () => {
+    const { coordinator, ipc, tmux } = fixture();
     coordinator.restore([completedRun()]);
     await coordinator.control({ runId: "run-1", action: "resume" });
     let releaseSend!: () => void;
@@ -233,6 +238,8 @@ describe("run coordinator", () => {
     await followingUp;
     await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Checked" });
     assert.equal((await waiting).status, "completed");
+    assert.equal(coordinator.list()[0]?.paneState, "closed");
+    assert.deepEqual(tmux.closed, ["%9"]);
     await coordinator.shutdown();
   });
 

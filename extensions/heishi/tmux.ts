@@ -24,9 +24,15 @@ export interface TmuxLaunch {
   environment: Record<string, string>;
 }
 
+export interface TmuxTarget {
+  paneId: string;
+  windowId: string;
+  sessionId: string;
+}
+
 export interface TmuxAdapter {
   validate(): Promise<void>;
-  launch(spec: TmuxLaunch): Promise<string>;
+  launch(spec: TmuxLaunch): Promise<TmuxTarget>;
   exists(target: string): Promise<boolean>;
   focus(target: string): Promise<void>;
   close(target: string): Promise<void>;
@@ -53,22 +59,24 @@ export class Tmux implements TmuxAdapter {
     }
   }
 
-  async launch(spec: TmuxLaunch): Promise<string> {
+  async launch(spec: TmuxLaunch): Promise<TmuxTarget> {
     if (spec.command.length === 0) throw new Error("Subagent command is empty");
     const operation = spec.placement === "pane" ? "split-window" : "new-window";
-    const args = [operation, "-d", "-P", "-F", "#{pane_id}", "-c", spec.cwd];
+    const args = [operation, "-d", "-P", "-F", "#{pane_id} #{window_id} #{session_id}", "-c", spec.cwd];
     if (spec.placement === "window") args.push("-n", spec.title);
     for (const [key, value] of Object.entries(spec.environment)) args.push("-e", `${key}=${value}`);
     args.push(`exec ${spec.command.map(shellQuote).join(" ")}`);
 
     const result = await this.executor.exec("tmux", args);
-    const target = result.stdout.trim();
-    if (!target.startsWith("%")) throw new Error(`tmux did not return a pane target: ${target}`);
+    const [paneId, windowId, sessionId] = result.stdout.trim().split(" ");
+    if (!paneId?.startsWith("%") || !windowId?.startsWith("@") || !sessionId?.startsWith("$")) {
+      throw new Error(`tmux did not return pane, window, and session IDs: ${result.stdout.trim()}`);
+    }
     try {
-      await this.executor.exec("tmux", ["select-pane", "-t", target, "-T", spec.title]);
-      return target;
+      await this.executor.exec("tmux", ["select-pane", "-t", paneId, "-T", spec.title]);
+      return { paneId, windowId, sessionId };
     } catch (error) {
-      await this.executor.exec("tmux", ["kill-pane", "-t", target]).catch(() => undefined);
+      await this.executor.exec("tmux", ["kill-pane", "-t", paneId]).catch(() => undefined);
       throw error;
     }
   }

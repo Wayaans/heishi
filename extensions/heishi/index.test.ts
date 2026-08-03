@@ -13,6 +13,11 @@ interface RegisteredTool {
       anyOf?: Array<{ const?: string }>;
     }>;
   };
+  renderResult?: (
+    result: { content: Array<{ type: string; text?: string }>; details?: unknown },
+    options: unknown,
+    theme: unknown,
+  ) => { render(width: number): string[] };
 }
 
 describe("Heishi tool prompt metadata", () => {
@@ -46,6 +51,39 @@ describe("Heishi tool prompt metadata", () => {
       control.parameters.properties?.["action"]?.anyOf?.map((action) => action.const),
       ["prompt", "steer", "follow_up", "abort", "resume"],
     );
+  });
+
+  it("renders running location metadata without repeating model and thinking", () => {
+    const tools: RegisteredTool[] = [];
+    const pi = {
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI;
+    heishi(pi);
+
+    const renderResult = requireTool(tools, "subagent_start").renderResult;
+    assert.ok(renderResult);
+    const rendered = renderResult({
+      content: [],
+      details: {
+        runId: "12345678-1234-1234-1234-123456789abc",
+        alias: "Atalanta",
+        status: "running",
+        tmuxTarget: "%9",
+        tmuxWindowId: "@2",
+        tmuxSessionId: "$1",
+        model: "openai/model",
+        thinking: "high",
+      },
+    }, {}, {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    }).render(200).join("\n");
+
+    assert.match(rendered, /^→ Atalanta · 123456  running/u);
+    assert.match(rendered, /pane id %9 · window id @2 · session id \$1/u);
+    assert.doesNotMatch(rendered, /openai\/model|high/u);
   });
 });
 
