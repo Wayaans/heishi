@@ -107,7 +107,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Choose the `subagent_start` model and thinking level only from the Heishi delegation pool included in the system prompt.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
-      "After `subagent_start` returns, use `subagent_control` for live interaction and `subagent_wait` for the settled structured report.",
+      "After every successful `subagent_start`, use `subagent_control` first only when live interaction is needed, then use `subagent_wait` for every started run; otherwise use `subagent_wait` immediately. Do not inspect, implement, or answer the user until all waits return.",
     ],
     parameters: Type.Object({
       task: Type.String({ description: "Self-contained delegated task, including all context the subagent needs from the parent conversation" }),
@@ -166,7 +166,9 @@ export default function heishi(pi: ExtensionAPI): void {
       "Use `subagent_control` with the full authoritative run UUID returned by `subagent_start`; aliases are display-only.",
       "Include `message` when using `subagent_control` actions `prompt`, `steer`, or `follow_up`.",
       "Use `subagent_control` action `steer` during active work, `follow_up` to queue work after the current turn, and `prompt` to start new work while idle.",
-      "Use `resume` only to reconnect a disconnected subagent before another control action.",
+      "After `subagent_wait` returns, the worker is settled and auto-closed. Use `subagent_control` with `resume` before assigning new work with `prompt` or `follow_up`.",
+      "Use `steer` only while a subagent is actively running and connected; do not use `steer` after `subagent_wait`. Resume it and use `prompt` or `follow_up` instead.",
+      "After `prompt`, `follow_up`, or `steer`, use `subagent_wait` before the main agent inspects, implements, or answers with the delegated result.",
     ],
     parameters: Type.Object({
       runId: Type.String({ description: "Full authoritative run UUID returned by subagent_start" }),
@@ -207,7 +209,7 @@ export default function heishi(pi: ExtensionAPI): void {
     description: "Wait until a subagent's current delegated work reaches agent_settled, then return its structured report, verified session metadata, and run duration.",
     promptSnippet: "Wait for a tmux subagent to settle and return its structured report",
     promptGuidelines: [
-      "Use `subagent_wait` with the full run UUID after starting or controlling a subagent when the parent needs its final result.",
+      "Use `subagent_wait` with the full run UUID after every successful `subagent_start` and after `subagent_control` starts or changes work; waiting is mandatory before the main agent inspects, implements, or answers with the delegated result.",
       "Treat the result of `subagent_wait`, which waits for `agent_settled`, as completion; do not infer completion from tmux pane output or `agent_end`.",
     ],
     parameters: Type.Object({

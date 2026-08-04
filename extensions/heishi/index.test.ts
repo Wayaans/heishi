@@ -46,7 +46,25 @@ describe("Heishi tool prompt metadata", () => {
       return guideline.includes("multiple `subagent_start` tool calls in the same turn")
         && guideline.includes("concurrently");
     }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("use `subagent_control` first only when live interaction is needed")
+        && guideline.includes("otherwise use `subagent_wait` immediately")
+        && guideline.includes("Do not inspect, implement, or answer");
+    }));
     assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping work") && guideline.includes("worktrees")));
+    assert.ok(control.promptGuidelines?.some((guideline) => {
+      return guideline.includes("After `subagent_wait` returns")
+        && guideline.includes("`resume`")
+        && guideline.includes("`prompt` or `follow_up`");
+    }));
+    assert.ok(control.promptGuidelines?.some((guideline) => {
+      return guideline.includes("Use `steer` only while")
+        && guideline.includes("do not use `steer` after `subagent_wait`");
+    }));
+    assert.ok(control.promptGuidelines?.some((guideline) => {
+      return guideline.includes("After `prompt`, `follow_up`, or `steer`")
+        && guideline.includes("`subagent_wait`");
+    }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("`placement` parameter is optional")
         && guideline.includes("Omit it unless the user explicitly requests")
