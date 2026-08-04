@@ -95,6 +95,42 @@ describe("Heishi tool prompt metadata", () => {
     assert.match(rendered, /Duration: 1m 23s$/u);
   });
 
+  it("shows provider, model, and thinking only for resume control results", () => {
+    const tools: RegisteredTool[] = [];
+    const pi = {
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI;
+    heishi(pi);
+
+    const renderResult = requireTool(tools, "subagent_control").renderResult;
+    assert.ok(renderResult);
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    };
+    const details = {
+      runId: "12345678-1234-1234-1234-123456789abc",
+      alias: "Atalanta",
+      status: "completed",
+      model: "openai-codex/gpt-5.6-luna",
+      thinking: "high",
+    };
+
+    const resumed = renderResult({
+      content: [],
+      details: { ...details, action: "resume" },
+    }, {}, theme).render(200).join("\n");
+    const prompted = renderResult({
+      content: [],
+      details: { ...details, action: "prompt" },
+    }, {}, theme).render(200).join("\n");
+
+    assert.match(resumed, /Resumed with: openai-codex\/gpt-5\.6-luna \/ high/u);
+    assert.doesNotMatch(prompted, /openai-codex\/gpt-5\.6-luna|high/u);
+  });
+
   it("renders running location metadata without repeating model and thinking", () => {
     const tools: RegisteredTool[] = [];
     const pi = {

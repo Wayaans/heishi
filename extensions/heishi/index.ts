@@ -188,7 +188,7 @@ export default function heishi(pi: ExtensionAPI): void {
           throw new Error(`Subagent model/thinking pair is no longer allowed: ${run.model} / ${run.thinking}`);
         }
       }
-      return toolResult(await requireCoordinator().control(input));
+      return controlToolResult(await requireCoordinator().control(input), params.action);
     },
     renderCall(args, theme) {
       const runId = typeof args.runId === "string" ? shortRunId(args.runId) : "…";
@@ -197,7 +197,7 @@ export default function heishi(pi: ExtensionAPI): void {
       return new Text(text, 0, 0);
     },
     renderResult(result, _options, theme) {
-      return renderRunResult(result.details as RunResult | undefined, result, theme);
+      return renderControlRunResult(result.details as ControlRunResult | undefined, result, theme);
     },
   });
 
@@ -321,6 +321,10 @@ interface RenderableResult {
   content: Array<{ type: string; text?: string }>;
 }
 
+interface ControlRunResult extends RunResult {
+  action: ControlInput["action"];
+}
+
 function fallbackResult(result: RenderableResult): Text {
   const text = result.content.find((part) => part.type === "text")?.text ?? "";
   return new Text(text, 0, 0);
@@ -329,6 +333,14 @@ function fallbackResult(result: RenderableResult): Text {
 function renderRunResult(details: RunResult | undefined, result: RenderableResult, theme: Theme): Text {
   if (!details) return fallbackResult(result);
   return new Text(runStatusHeader(details, theme), 0, 0);
+}
+
+function renderControlRunResult(details: ControlRunResult | undefined, result: RenderableResult, theme: Theme): Text {
+  if (!details) return fallbackResult(result);
+  const resumedWith = details.action === "resume"
+    ? `\n  ${theme.fg("dim", `Resumed with: ${details.model} / ${details.thinking}`)}`
+    : "";
+  return new Text(`${runStatusHeader(details, theme)}${resumedWith}`, 0, 0);
 }
 
 function runStatusHeader(result: RunResult, theme: Theme): string {
@@ -356,5 +368,16 @@ function toolResult(
   return {
     content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     details: result,
+  };
+}
+
+function controlToolResult(
+  result: RunResult,
+  action: ControlInput["action"],
+): { content: Array<{ type: "text"; text: string }>; details: ControlRunResult } {
+  const details = { ...result, action };
+  return {
+    content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+    details,
   };
 }
