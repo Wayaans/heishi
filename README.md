@@ -16,7 +16,7 @@ Heishi lets Pi delegate work to concurrent agent sessions, steer them while they
 pi install git:github.com/Wayaans/heishi
 ```
 
-Restart Pi, then configure the model and thinking-level pairs available to subagents:
+Restart Pi, then configure the model and thinking-level pairs available to constrained workers:
 
 ```text
 /heishi model
@@ -26,11 +26,20 @@ Restart Pi, then configure the model and thinking-level pairs available to subag
 
 Heishi gives Pi three tools:
 
-- `subagent_start` — start a subagent in tmux
-- `subagent_control` — prompt, steer, follow up, abort, or resume a subagent
-- `subagent_wait` — wait for a subagent to finish and return its report
+- `subagent_start` — start a managed worker in tmux
+- `subagent_control` — prompt, steer, follow up, abort, or resume a worker
+- `subagent_wait` — wait for a worker to finish and return its report
 
-Use `/subagent` to manage subagents in the interactive overlay.
+Workers have two modes:
+
+- `sub` (default) uses Heishi's fast, constrained resource profile and requires a model/thinking pair configured through `/heishi model`.
+- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. It can use Pi's default authenticated model or optional authenticated model/thinking overrides, and it can delegate recursively.
+
+Set the current session's default for future runs with `/heishi mode`, `/heishi mode sub`, or `/heishi mode main`. An explicit `subagent_start.mode` overrides that default for one run. New and forked sessions default to `sub`; existing runs retain their original mode.
+
+Main workers mirror the parent session's project trust. They load trusted extensions with normal process permissions and model credentials; they are not sandboxes.
+
+Use `/subagent` to manage workers in the interactive overlay. Both modes prefer structured reports and fall back to the worker's final assistant response.
 
 By default, workers open in a detached window in the `heishi-subagents` tmux session. They can also open in the current tmux session as a pane or detached window.
 

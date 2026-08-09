@@ -9,11 +9,15 @@ import type { RunRecord } from "./types.js";
 class FakeChannel implements WorkerChannel {
   readonly socketPath = "/tmp/worker.sock";
   readonly sent: Array<{ type: string; payload?: Record<string, unknown> }> = [];
+  readonly readinessTimeouts: Array<number | undefined> = [];
   closed = false;
   sendGate?: Promise<void>;
 
   constructor(readonly ready: WorkerReady) {}
-  async waitForReady(): Promise<WorkerReady> { return this.ready; }
+  async waitForReady(timeoutMs?: number): Promise<WorkerReady> {
+    this.readinessTimeouts.push(timeoutMs);
+    return this.ready;
+  }
   async send(type: string, payload?: Record<string, unknown>): Promise<void> {
     this.sent.push(payload === undefined ? { type } : { type, payload });
     await this.sendGate;
@@ -69,6 +73,7 @@ function fixture(ready: Partial<WorkerReady> = {}): {
     tmux,
     ipc,
     persist: (record) => { records.push(structuredClone(record)); },
+    projectTrusted: true,
     newRunId: () => runNumber++ === 0
       ? "12345678-1234-1234-1234-123456789abc"
       : "abcdefab-1234-1234-1234-123456789abc",
@@ -84,7 +89,8 @@ function fixture(ready: Partial<WorkerReady> = {}): {
 
 function completedRun(): RunRecord {
   return {
-    version: 1,
+    version: 2,
+    mode: "sub",
     runId: "run-1",
     alias: "Circe",
     taskPreview: "Inspect",
@@ -98,6 +104,15 @@ function completedRun(): RunRecord {
     workerSessionFile: "/sessions/session-1.jsonl",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:01:00.000Z",
+  };
+}
+
+function completedMainRun(): RunRecord {
+  return {
+    ...completedRun(),
+    mode: "main",
+    model: "provider/current",
+    thinking: "medium",
   };
 }
 
@@ -117,6 +132,8 @@ describe("run coordinator", () => {
     assert.deepEqual((ipc.channel).sent[0], { type: "task", payload: { task: "Inspect the repository" } });
     assert.equal(tmux.launches[0]?.command.includes("--no-context-files"), false);
     assert.equal(tmux.launches[0]?.command.includes("--no-session"), false);
+    assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "sub");
+    assert.deepEqual(ipc.channel.readinessTimeouts, [undefined]);
 
     await ipc.emit({
       type: "report", runId: started.runId, version: 1,
@@ -129,6 +146,74 @@ describe("run coordinator", () => {
     assert.equal(completed.report?.summary, "Done");
     assert.equal(completed.durationMs, 3_000);
     assert.deepEqual(tmux.closed, ["%9"]);
+  });
+
+  it("starts main mode with Pi defaults and persists effective readiness metadata", async () => {
+    const { coordinator, ipc, tmux } = fixture({ model: "provider/default", thinking: "medium" });
+
+    const started = await coordinator.start({ mode: "main", task: "Inspect the repository" });
+
+    assert.equal(started.mode, "main");
+    assert.equal(started.model, "provider/default");
+    assert.equal(started.thinking, "medium");
+    assert.deepEqual(ipc.channel.readinessTimeouts, [60_000]);
+    assert.equal(tmux.launches[0]?.command.includes("--no-extensions"), false);
+    assert.equal(tmux.launches[0]?.command.includes("--approve"), true);
+    assert.equal(tmux.launches[0]?.command.includes("--model"), false);
+    assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "main");
+    await coordinator.shutdown();
+  });
+
+  it("uses structured reports and final-text fallback in main mode", async () => {
+    const structured = fixture();
+    const first = await structured.coordinator.start({ mode: "main", task: "Inspect" });
+    await structured.ipc.emit({
+      type: "report",
+      runId: first.runId,
+      version: 1,
+      report: { status: "completed", summary: "Structured main report" },
+    });
+    await structured.ipc.emit({ type: "settled", runId: first.runId, version: 1, finalText: "Fallback" });
+    const structuredResult = await structured.coordinator.wait(first.runId);
+    assert.equal(structuredResult.report?.summary, "Structured main report");
+    assert.equal(structuredResult.report?.structured, true);
+
+    const fallback = fixture();
+    const second = await fallback.coordinator.start({ mode: "main", task: "Inspect" });
+    await fallback.ipc.emit({ type: "settled", runId: second.runId, version: 1, finalText: "Main fallback" });
+    const fallbackResult = await fallback.coordinator.wait(second.runId);
+    assert.equal(fallbackResult.report?.summary, "Main fallback");
+    assert.equal(fallbackResult.report?.structured, false);
+  });
+
+  it("verifies only the main launch overrides that were supplied", async () => {
+    const accepted = fixture({ model: "provider/requested", thinking: "low" });
+    const started = await accepted.coordinator.start({
+      mode: "main",
+      task: "Inspect",
+      model: "provider/requested",
+    });
+    assert.equal(started.status, "running");
+    assert.equal(started.thinking, "low");
+    await accepted.coordinator.shutdown();
+
+    const rejected = fixture({ model: "provider/fallback" });
+    const failed = await rejected.coordinator.start({
+      mode: "main",
+      task: "Inspect",
+      model: "provider/requested",
+    });
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /requested model provider\/requested.*provider\/fallback/u);
+  });
+
+  it("rejects main thinking without an explicit model", async () => {
+    const { coordinator } = fixture();
+
+    await assert.rejects(
+      () => coordinator.start({ mode: "main", task: "Inspect", thinking: "high" }),
+      /requires an explicit model/u,
+    );
   });
 
   it("cancels startup without overwriting the terminal status", async () => {
@@ -273,6 +358,38 @@ describe("run coordinator", () => {
 
     await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Direct work done" });
     assert.equal((await waiting).report?.summary, "Direct work done");
+    await coordinator.shutdown();
+  });
+
+  it("resumes main sessions without forcing their last effective model or thinking", async () => {
+    const { coordinator, tmux } = fixture({ model: "provider/changed", thinking: "max" });
+    coordinator.restore([completedMainRun()]);
+
+    const resumed = await coordinator.control({ runId: "run-1", action: "resume" });
+
+    assert.equal(resumed.mode, "main");
+    assert.equal(resumed.model, "provider/changed");
+    assert.equal(resumed.thinking, "max");
+    assert.equal(tmux.launches[0]?.command.includes("--model"), false);
+    assert.equal(tmux.launches[0]?.command.includes("--thinking"), false);
+    assert.deepEqual(tmux.launches[0]?.command.slice(-2), ["--session", "/sessions/session-1.jsonl"]);
+    await coordinator.shutdown();
+  });
+
+  it("tracks main model and thinking changes reported by the bridge", async () => {
+    const { coordinator, ipc } = fixture();
+    const started = await coordinator.start({ mode: "main", task: "Inspect" });
+
+    await ipc.emit({
+      type: "metadata",
+      runId: started.runId,
+      version: 1,
+      model: "provider/switched",
+      thinking: "xhigh",
+    });
+
+    assert.equal(coordinator.list()[0]?.model, "provider/switched");
+    assert.equal(coordinator.list()[0]?.thinking, "xhigh");
     await coordinator.shutdown();
   });
 

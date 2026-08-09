@@ -10,6 +10,7 @@ import {
   availableModelChoices,
   loadEffectiveConfig,
   saveConfig,
+  validateMainOverrides,
   type DelegationConfig,
   type ModelChoice,
 } from "./model-config.js";
@@ -84,6 +85,25 @@ describe("Heishi delegation model configuration", () => {
     const scope: ScopedModel[] = [{ model: nonReasoning, thinkingLevel: "high" }];
 
     assert.deepEqual(availableModelChoices([nonReasoning], scope), []);
+  });
+
+  it("validates main overrides against every authenticated model without scoped filtering", () => {
+    const authenticated = model("provider", "authenticated");
+
+    assert.doesNotThrow(() => validateMainOverrides("provider/authenticated", "high", [authenticated]));
+    assert.doesNotThrow(() => validateMainOverrides("provider/authenticated", undefined, [authenticated]));
+    assert.doesNotThrow(() => validateMainOverrides(undefined, undefined, [authenticated]));
+    assert.throws(() => validateMainOverrides(undefined, "high", [authenticated]), /requires an explicit model/u);
+    assert.throws(() => validateMainOverrides("provider/missing", undefined, [authenticated]), /not authenticated/u);
+  });
+
+  it("rejects a main thinking level unsupported by the selected model", () => {
+    const nonReasoning = { ...model("provider", "plain"), reasoning: false };
+
+    assert.throws(
+      () => validateMainOverrides("provider/plain", "high", [nonReasoning]),
+      /does not support thinking high/u,
+    );
   });
 });
 

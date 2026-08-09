@@ -18,29 +18,34 @@ import {
   loadConfig,
   loadEffectiveConfig,
   saveConfig,
+  validateMainOverrides,
   type DelegationConfig,
   type DelegationPair,
 } from "./model-config.js";
 import { pickDelegationPairs } from "./model-picker.js";
 import { showSubagentOverlay } from "./overlay.js";
-import { reconcileRuns, restoreRunSnapshots, RUN_ENTRY_TYPE } from "./registry.js";
+import {
+  MODE_ENTRY_TYPE,
+  reconcileRuns,
+  restoreRunSnapshots,
+  restoreSessionMode,
+  RUN_ENTRY_TYPE,
+} from "./registry.js";
 import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
-import { Tmux } from "./tmux.js";
-import type { ControlInput, RunResult, StartInput, WaitResult } from "./types.js";
-import { registerWorkerBridge } from "./worker.js";
+import { THINKING_LEVELS, Tmux } from "./tmux.js";
+import type { ControlInput, RunResult, StartInput, WaitResult, WorkerMode } from "./types.js";
+import { registerWorkerBridge, resolveWorkerMode } from "./worker.js";
 
-const ThinkingSchema = Type.Union([
-  Type.Literal("off"),
-  Type.Literal("minimal"),
-  Type.Literal("low"),
-  Type.Literal("medium"),
-  Type.Literal("high"),
-  Type.Literal("xhigh"),
-  Type.Literal("max"),
-], { description: "Explicit thinking level for the subagent; no default or fallback is applied" });
+const ThinkingSchema = Type.Union(
+  THINKING_LEVELS.map((level) => Type.Literal(level)),
+  { description: "Optional thinking level. Required for sub mode; main mode requires a model when thinking is supplied" },
+);
 
 export default function heishi(pi: ExtensionAPI): void {
-  if (process.env["HEISHI_WORKER"] === "1") {
+  const workerMode = process.env["HEISHI_WORKER"] === "1"
+    ? resolveWorkerMode(process.env)
+    : undefined;
+  if (workerMode === "sub") {
     registerWorkerBridge(pi);
     return;
   }
@@ -51,6 +56,7 @@ export default function heishi(pi: ExtensionAPI): void {
   let coordinator: RunCoordinator | undefined;
   let delegationConfig: DelegationConfig = { models: [] };
   let delegationConfigError: string | undefined;
+  let defaultMode: WorkerMode = "sub";
 
   const createCoordinator = (ctx: ExtensionContext): RunCoordinator => new RunCoordinator({
     cwd: ctx.cwd,
@@ -59,6 +65,7 @@ export default function heishi(pi: ExtensionAPI): void {
     tmux,
     ipc,
     persist: (record) => pi.appendEntry(RUN_ENTRY_TYPE, record),
+    projectTrusted: ctx.isProjectTrusted(),
   });
 
   const requireCoordinator = (): RunCoordinator => {
@@ -66,9 +73,12 @@ export default function heishi(pi: ExtensionAPI): void {
     return coordinator;
   };
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     if (coordinator) await coordinator.shutdown();
     coordinator = createCoordinator(ctx);
+    const startsNewSession = event.reason === "new" || event.reason === "fork";
+    defaultMode = startsNewSession ? "sub" : restoreSessionMode(ctx.sessionManager.getBranch()) ?? "sub";
+    if (startsNewSession) pi.appendEntry(MODE_ENTRY_TYPE, { mode: "sub" });
     const loaded = await loadEffectiveConfig(
       join(getAgentDir(), "heishi.json"),
       join(ctx.cwd, CONFIG_DIR_NAME, "heishi.json"),
@@ -97,42 +107,56 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_start",
     label: "Start Subagent",
-    description: "Start an asynchronous persistent subagent in an interactive tmux session. The subagent does not receive the parent conversation, so provide a self-contained task plus an explicit model and thinking level.",
+    description: "Start an asynchronous persistent worker in sub or main mode. Sub is constrained and requires an allowed model/thinking pair; main loads normal Pi resources and accepts optional authenticated-model overrides.",
     promptSnippet: "Start persistent interactive tmux subagents for delegated work",
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
       "Give `subagent_start` a self-contained task because the subagent does not receive the parent conversation.",
-      "Always provide `subagent_start` an explicit model in `provider/model` form and an explicit thinking level; there are no defaults or silent fallbacks.",
+      "The optional `mode` parameter overrides the current Heishi session default for that run.",
+      "Use `sub` mode for bounded delegated work that benefits from the constrained, fast resource profile. Sub mode requires an explicit model/thinking pair from the Heishi delegation pool.",
+      "Use `main` mode when the worker needs normal Pi extensions, skills, tools, prompt templates, or unrestricted authenticated-model selection. Main model/thinking overrides are optional.",
       "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission falls back to `session`.",
-      "Choose the `subagent_start` model and thinking level only from the Heishi delegation pool included in the system prompt.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
       "After every successful `subagent_start`, use `subagent_control` first only when live interaction is needed, then use `subagent_wait` for every started run; otherwise use `subagent_wait` immediately. Do not inspect, implement, or answer the user until all waits return.",
     ],
     parameters: Type.Object({
+      mode: Type.Optional(Type.Union(
+        [Type.Literal("sub"), Type.Literal("main")],
+        { description: "Optional worker mode. Explicit mode overrides the current session default" },
+      )),
       task: Type.String({ description: "Self-contained delegated task, including all context the subagent needs from the parent conversation" }),
       alias: Type.Optional(Type.String({ description: "Optional display alias; if omitted, a Greek mythological name is chosen" })),
-      model: Type.String({ description: "Required model in provider/model form, for example openai-codex/gpt-5.6-sol" }),
-      thinking: ThinkingSchema,
+      model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode; optional authenticated-model override in main mode" })),
+      thinking: Type.Optional(ThinkingSchema),
       placement: Type.Optional(Type.Union(
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
         { description: "Optional worker placement. Omit unless the user explicitly requests one; omission falls back to session, which opens a detached window in the named heishi-subagents tmux session" },
       )),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const pairs = effectivePairs(ctx);
-      if (pairs.length === 0) {
-        throw new Error(delegationConfigError ?? "Heishi delegation models are not configured; use /heishi model");
-      }
-      if (!pairs.some((pair) => pair.model === params.model && pair.thinking === params.thinking)) {
-        throw new Error(`Subagent model/thinking pair is not allowed: ${params.model} / ${params.thinking}`);
+      const mode = params.mode ?? defaultMode;
+      if (mode === "sub") {
+        const pairs = effectivePairs(ctx);
+        if (pairs.length === 0) {
+          throw new Error(delegationConfigError ?? "Heishi delegation models are not configured; use /heishi model");
+        }
+        if (params.model === undefined || params.thinking === undefined) {
+          throw new Error("Sub mode requires an explicit model and thinking level");
+        }
+        if (!pairs.some((pair) => pair.model === params.model && pair.thinking === params.thinking)) {
+          throw new Error(`Subagent model/thinking pair is not allowed: ${params.model} / ${params.thinking}`);
+        }
+      } else {
+        validateMainOverrides(params.model, params.thinking, ctx.modelRegistry.getAvailable());
       }
 
       const input: StartInput = {
+        mode,
         task: params.task,
-        model: params.model,
-        thinking: params.thinking,
       };
+      if (params.model !== undefined) input.model = params.model;
+      if (params.thinking !== undefined) input.thinking = params.thinking;
       if (params.alias !== undefined) input.alias = params.alias;
       if (params.placement !== undefined) input.placement = params.placement;
       return toolResult(await requireCoordinator().start(input, signal));
@@ -141,8 +165,9 @@ export default function heishi(pi: ExtensionAPI): void {
       const container = new Container();
       const alias = args.alias?.trim() || "random alias";
       const task = typeof args.task === "string" ? args.task : "";
+      const mode = args.mode ? ` · ${args.mode}` : "";
       container.addChild(new Text(
-        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", ` · ${args.model ?? "…"} / ${args.thinking ?? "…"}`)}`,
+        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", `${mode} · ${args.model ?? "…"} / ${args.thinking ?? "…"}`)}`,
         0,
         0,
       ));
@@ -186,7 +211,7 @@ export default function heishi(pi: ExtensionAPI): void {
       if (params.message !== undefined) input.message = params.message;
       if (params.action === "prompt" || params.action === "follow_up" || params.action === "resume") {
         const run = requireCoordinator().list().find((candidate) => candidate.runId === params.runId);
-        if (run && !effectivePairs(ctx).some((pair) => pair.model === run.model && pair.thinking === run.thinking)) {
+        if (run?.mode === "sub" && !effectivePairs(ctx).some((pair) => pair.model === run.model && pair.thinking === run.thinking)) {
           throw new Error(`Subagent model/thinking pair is no longer allowed: ${run.model} / ${run.thinking}`);
         }
       }
@@ -250,21 +275,36 @@ export default function heishi(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event, ctx) => {
     const pairs = effectivePairs(ctx);
-    const guidance = pairs.length === 0
-      ? "Heishi subagent delegation is disabled. Do not call subagent_start or use subagent_control to resume or assign new work. The user can configure it with /heishi model."
+    const modeGuidance = [
+      `The current Heishi default mode is \`${defaultMode}\`.`,
+      "Omitting subagent_start.mode uses this default. An explicit mode overrides it for that run.",
+    ].join("\n");
+    const poolGuidance = pairs.length === 0
+      ? "Heishi sub mode is disabled until the user configures /heishi model. Main mode remains available."
       : [
-          "Heishi subagent delegation must use one of these exact model/thinking pairs:",
+          "Heishi sub mode must use one of these exact model/thinking pairs:",
           ...pairs.map((pair) => `- ${pair.model} / ${pair.thinking}`),
-          "Choose the pair that best fits each delegated task and pass both values explicitly to subagent_start. Do not resume or assign new work to an existing subagent whose pair is not listed.",
+          "These pairs restrict only sub mode. Choose the pair that best fits each sub-mode task and pass both values explicitly. Do not resume or assign new work to an existing sub-mode run whose pair is not listed.",
         ].join("\n");
-    return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
+    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${poolGuidance}` };
   });
 
   pi.registerCommand("heishi", {
     description: "Configure Heishi",
+    getArgumentCompletions: heishiArgumentCompletions,
     handler: async (args, ctx) => {
-      if (args.trim() !== "model") {
-        ctx.ui.notify("Usage: /heishi model", "info");
+      const command = args.trim();
+      if (command === "mode" || command === "mode sub" || command === "mode main") {
+        const requested = command === "mode" ? (defaultMode === "sub" ? "main" : "sub") : command.slice(5) as WorkerMode;
+        if (requested !== defaultMode) {
+          defaultMode = requested;
+          pi.appendEntry(MODE_ENTRY_TYPE, { mode: defaultMode });
+        }
+        ctx.ui.notify(`Heishi default mode: ${defaultMode}`, "info");
+        return;
+      }
+      if (command !== "model") {
+        ctx.ui.notify("Usage: /heishi model | /heishi mode [sub|main]", "info");
         return;
       }
       if (ctx.mode !== "tui") {
@@ -311,12 +351,31 @@ export default function heishi(pi: ExtensionAPI): void {
     },
   });
 
+  if (workerMode === "main") registerWorkerBridge(pi);
+
   function effectivePairs(ctx: ExtensionContext): DelegationPair[] {
     return allowedPairs(
       delegationConfig,
       availableModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels),
     );
   }
+}
+
+function heishiArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {
+  if (prefix.startsWith("mode ")) {
+    const nestedPrefix = prefix.slice("mode ".length);
+    const items = [
+      { value: "mode sub", label: "sub" },
+      { value: "mode main", label: "main" },
+    ].filter((item) => item.label.startsWith(nestedPrefix));
+    return items.length > 0 ? items : null;
+  }
+  if (prefix.includes(" ")) return null;
+  const items = [
+    { value: "model", label: "model" },
+    { value: "mode", label: "mode" },
+  ].filter((item) => item.value.startsWith(prefix));
+  return items.length > 0 ? items : null;
 }
 
 interface RenderableResult {
@@ -340,7 +399,7 @@ function renderRunResult(details: RunResult | undefined, result: RenderableResul
 function renderControlRunResult(details: ControlRunResult | undefined, result: RenderableResult, theme: Theme): Text {
   if (!details) return fallbackResult(result);
   const resumedWith = details.action === "resume"
-    ? `\n  ${theme.fg("dim", `Resumed with: ${details.model} / ${details.thinking}`)}`
+    ? `\n  ${theme.fg("dim", `Resumed with: ${details.model ?? "…"} / ${details.thinking ?? "…"}`)}`
     : "";
   return new Text(`${runStatusHeader(details, theme)}${resumedWith}`, 0, 0);
 }

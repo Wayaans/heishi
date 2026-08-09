@@ -23,5 +23,6 @@ export function shortRunId(runId: string): string {
 }
 
 export function runIdentity(result: RunResult): string {
-  return `${result.alias} · ${shortRunId(result.runId)}`;
+  const mode = result.mode === "main" ? " · main" : "";
+  return `${result.alias} · ${shortRunId(result.runId)}${mode}`;
 }

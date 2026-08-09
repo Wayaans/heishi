@@ -169,7 +169,7 @@ class SubagentList implements Component {
     const icon = this.theme.fg(statusColor(run.status), "■");
     const alias = this.theme.fg(selected ? "accent" : "text", run.alias);
     const identity = `${marker} ${icon} ${alias} ${this.theme.fg("dim", shortRunId(run.runId))} ${this.theme.fg("muted", `— ${run.taskPreview}`)}`;
-    const metadata = `${this.theme.fg("dim", `${run.model} · ${run.thinking} · ${paneLabel(run)} · ${elapsed(run)} ·`)} ${this.theme.fg(statusColor(run.status), run.status)}`;
+    const metadata = `${this.theme.fg("dim", `${run.mode} · ${run.model ?? "…"} · ${run.thinking ?? "…"} · ${paneLabel(run)} · ${elapsed(run)} ·`)} ${this.theme.fg(statusColor(run.status), run.status)}`;
     return this.frame(joinColumns(identity, metadata, width), width);
   }
 
@@ -233,7 +233,8 @@ async function showDetails(ctx: ExtensionCommandContext, run: RunRecord): Promis
     container.addChild(new Text(theme.fg("accent", theme.bold(`Subagent: ${run.alias} · ${shortRunId(run.runId)}`)), 1, 0));
     container.addChild(new Text([
       `Status: ${run.status}`,
-      `Model/thinking: ${run.model} / ${run.thinking}`,
+      `Mode: ${run.mode}`,
+      `Model/thinking: ${run.model ?? "not selected"} / ${run.thinking ?? "not selected"}`,
       `Pane: ${run.paneState}${run.tmuxTarget ? ` (${run.tmuxTarget})` : ""}`,
       `Session: ${run.workerSessionFile ?? "not created"}`,
       `Task: ${run.taskPreview}`,

@@ -2,7 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
 import type { ProtocolEnvelope } from "./protocol.js";
 import { isActive } from "./registry.js";
-import { buildPiCommand, type ThinkingLevel, type TmuxAdapter } from "./tmux.js";
+import { buildPiCommand, THINKING_LEVELS, type ThinkingLevel, type TmuxAdapter } from "./tmux.js";
 import {
   resultFromRun,
   type ControlInput,
@@ -11,9 +11,11 @@ import {
   type StartInput,
   type SubagentReport,
   type WaitResult,
+  type WorkerMode,
 } from "./types.js";
 
 const SUBAGENT_SESSION_NAME = "heishi-subagents";
+const MAIN_READINESS_TIMEOUT_MS = 60_000;
 
 const MYTHOLOGICAL_NAMES = [
   "Achilles", "Andromeda", "Ariadne", "Atalanta", "Cassandra", "Circe", "Daedalus", "Electra",
@@ -27,6 +29,7 @@ export interface CoordinatorDependencies {
   tmux: TmuxAdapter;
   ipc: IpcAdapter;
   persist(record: RunRecord): void;
+  projectTrusted: boolean;
   newRunId?: () => string;
   newToken?: () => string;
   chooseAlias?: () => string;
@@ -67,19 +70,20 @@ export class RunCoordinator {
   }
 
   async start(input: StartInput, signal?: AbortSignal): Promise<RunResult> {
-    validateStart(input);
+    const mode = validateStart(input);
     if (signal?.aborted) throw new Error("Subagent start was cancelled");
 
     const runId = this.newRunId();
     const timestamp = this.now();
     const run: RunRecord = {
-      version: 1,
+      version: 2,
+      mode,
       runId,
       alias: resolveAlias(input.alias, this.chooseAlias),
       taskPreview: preview(input.task),
       cwd: this.dependencies.cwd,
-      model: input.model,
-      thinking: input.thinking,
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
       placement: input.placement ?? "session",
       status: "created",
       paneState: "closed",
@@ -117,13 +121,14 @@ export class RunCoordinator {
         abortListener = () => { void this.abortRun(runId); };
         signal.addEventListener("abort", abortListener, { once: true });
       }
-      const ready = await channel.waitForReady();
+      const ready = await waitForWorkerReady(channel, run.mode);
       throwIfAborted(signal);
       this.update(run, {
         workerSessionId: ready.sessionId,
         workerSessionFile: ready.sessionFile,
       });
-      verifyReady(run, ready);
+      verifyInitialReady(run, ready, input.model, input.thinking);
+      this.update(run, { model: ready.model, thinking: parseThinkingLevel(ready.thinking) });
       await channel.send("task", { task: input.task });
       throwIfAborted(signal);
       this.update(run, { status: "running", startedAt: this.now() });
@@ -247,11 +252,12 @@ export class RunCoordinator {
       };
       this.runtimes.set(run.runId, runtime);
       await this.launchWorker(run, runtime, token, true);
-      const ready = await channel.waitForReady();
-      verifyReady(run, ready);
+      const ready = await waitForWorkerReady(channel, run.mode);
+      if (run.mode === "sub") verifyInitialReady(run, ready, run.model, run.thinking);
       if (ready.sessionId !== run.workerSessionId) {
         throw new Error(`Subagent resumed session ${ready.sessionId}, expected ${run.workerSessionId}`);
       }
+      this.update(run, { model: ready.model, thinking: parseThinkingLevel(ready.thinking) });
       return resultFromRun(run);
     } catch (error) {
       const runtime = this.runtimes.get(run.runId);
@@ -271,11 +277,15 @@ export class RunCoordinator {
   ): Promise<void> {
     const title = `${run.alias} · ${shortId(run.runId)}`;
     const commandOptions = {
+      mode: run.mode,
       piPath: this.dependencies.piPath,
       extensionPath: this.dependencies.extensionPath,
-      model: run.model,
-      thinking: run.thinking,
+      ...(!resume || run.mode === "sub" ? {
+        ...(run.model !== undefined ? { model: run.model } : {}),
+        ...(run.thinking !== undefined ? { thinking: run.thinking } : {}),
+      } : {}),
       name: `Subagent: ${title}`,
+      projectTrusted: this.dependencies.projectTrusted,
       ...(resume && run.workerSessionFile ? { sessionFile: run.workerSessionFile } : {}),
     };
     const target = await this.dependencies.tmux.launch({
@@ -284,7 +294,7 @@ export class RunCoordinator {
       cwd: run.cwd,
       title,
       command: buildPiCommand(commandOptions),
-      environment: workerEnvironment(run.runId, token, runtime.channel.socketPath, resume),
+      environment: workerEnvironment(run.runId, token, runtime.channel.socketPath, resume, run.mode),
     });
     this.update(run, {
       paneState: "open",
@@ -302,6 +312,13 @@ export class RunCoordinator {
     if (event.type === "report") {
       const report = parseReport(event["report"]);
       this.update(run, { report });
+      return;
+    }
+    if (event.type === "metadata" && run.mode === "main") {
+      const model = event["model"];
+      const thinking = event["thinking"];
+      if (typeof model !== "string" || !model) throw new Error("Subagent metadata is missing its model");
+      this.update(run, { model, thinking: parseThinkingLevel(thinking) });
       return;
     }
     if (event.type === "progress" && event["workStarted"] === true) {
@@ -417,13 +434,26 @@ export class RunCoordinator {
   }
 }
 
-function verifyReady(run: RunRecord, ready: WorkerReady): void {
-  if (ready.model !== run.model) {
-    throw new Error(`Subagent requested model ${run.model}, but Pi started ${ready.model}`);
+function verifyInitialReady(
+  run: RunRecord,
+  ready: WorkerReady,
+  requestedModel: string | undefined,
+  requestedThinking: ThinkingLevel | undefined,
+): void {
+  if (requestedModel !== undefined && ready.model !== requestedModel) {
+    throw new Error(`Subagent requested model ${requestedModel}, but Pi started ${ready.model}`);
   }
-  if (ready.thinking !== run.thinking) {
-    throw new Error(`Subagent requested thinking ${run.thinking}, but Pi started ${ready.thinking}`);
+  if (requestedThinking !== undefined && ready.thinking !== requestedThinking) {
+    throw new Error(`Subagent requested thinking ${requestedThinking}, but Pi started ${ready.thinking}`);
   }
+  if (run.mode === "sub" && (requestedModel === undefined || requestedThinking === undefined)) {
+    throw new Error("Subagent model and thinking are required");
+  }
+  parseThinkingLevel(ready.thinking);
+}
+
+function waitForWorkerReady(channel: WorkerChannel, mode: WorkerMode): Promise<WorkerReady> {
+  return channel.waitForReady(mode === "main" ? MAIN_READINESS_TIMEOUT_MS : undefined);
 }
 
 function workerEnvironment(
@@ -431,9 +461,11 @@ function workerEnvironment(
   token: string,
   socketPath: string,
   resume: boolean,
+  mode: WorkerMode,
 ): Record<string, string> {
   return {
     HEISHI_WORKER: "1",
+    HEISHI_WORKER_MODE: mode,
     HEISHI_RUN_ID: runId,
     HEISHI_TOKEN: token,
     HEISHI_SOCKET: socketPath,
@@ -441,11 +473,25 @@ function workerEnvironment(
   };
 }
 
-function validateStart(input: StartInput): void {
+function validateStart(input: StartInput): WorkerMode {
   if (!input.task.trim()) throw new Error("Subagent task is required");
-  if (!input.model.trim()) throw new Error("Subagent model is required");
-  const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-  if (!levels.includes(input.thinking)) throw new Error("Invalid subagent thinking level");
+  const mode = input.mode ?? "sub";
+  if (mode === "main") {
+    if (input.thinking !== undefined && !input.model?.trim()) {
+      throw new Error("Main-agent thinking requires an explicit model");
+    }
+    if (input.model !== undefined && !input.model.trim()) throw new Error("Main-agent model is required");
+    return mode;
+  }
+  if (!input.model?.trim()) throw new Error("Subagent model is required");
+  if (input.thinking === undefined) throw new Error("Subagent thinking level is required");
+  parseThinkingLevel(input.thinking);
+  return mode;
+}
+
+function parseThinkingLevel(value: unknown): ThinkingLevel {
+  if (!THINKING_LEVELS.includes(value as ThinkingLevel)) throw new Error("Invalid subagent thinking level");
+  return value as ThinkingLevel;
 }
 
 function resolveAlias(alias: string | undefined, chooseAlias: () => string): string {

@@ -160,13 +160,15 @@ describe("tmux adapter", () => {
 });
 
 describe("Pi command construction", () => {
-  it("loads only the bridge while preserving sessions and project context", () => {
+  it("preserves the exact constrained sub command", () => {
     assert.deepEqual(buildPiCommand({
+      mode: "sub",
       piPath: "/bin/pi",
       extensionPath: "/repo/extensions/heishi/index.ts",
       model: "openai/model",
       thinking: "high",
       name: "Subagent: Circe · 123456",
+      projectTrusted: true,
     }), [
       "/bin/pi",
       "--no-extensions",
@@ -176,6 +178,45 @@ describe("Pi command construction", () => {
       "--model", "openai/model",
       "--thinking", "high",
       "--name", "Subagent: Circe · 123456",
+    ]);
+  });
+
+  it("builds a trusted main command without disabling normal resources", () => {
+    const command = buildPiCommand({
+      mode: "main",
+      piPath: "/bin/pi",
+      extensionPath: "/repo/extensions/heishi/index.ts",
+      model: "openai/model",
+      thinking: "medium",
+      name: "Subagent: Circe · 123456",
+      projectTrusted: true,
+    });
+
+    assert.deepEqual(command, [
+      "/bin/pi",
+      "-e", "/repo/extensions/heishi/index.ts",
+      "--model", "openai/model",
+      "--thinking", "medium",
+      "--name", "Subagent: Circe · 123456",
+      "--approve",
+    ]);
+    assert.equal(command.some((argument) => argument.startsWith("--no-")), false);
+  });
+
+  it("lets Pi choose main model and thinking while mirroring untrusted project state", () => {
+    assert.deepEqual(buildPiCommand({
+      mode: "main",
+      piPath: "/bin/pi",
+      extensionPath: "/repo/extensions/heishi/index.ts",
+      name: "Subagent: Circe · 123456",
+      projectTrusted: false,
+      sessionFile: "/sessions/main.jsonl",
+    }), [
+      "/bin/pi",
+      "-e", "/repo/extensions/heishi/index.ts",
+      "--name", "Subagent: Circe · 123456",
+      "--no-approve",
+      "--session", "/sessions/main.jsonl",
     ]);
   });
 });

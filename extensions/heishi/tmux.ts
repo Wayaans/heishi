@@ -3,7 +3,8 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = typeof THINKING_LEVELS[number];
 export type Placement = "pane" | "window" | "session";
 
 export interface CommandExecutor {
@@ -144,16 +145,27 @@ export class Tmux implements TmuxAdapter {
 }
 
 export interface PiCommandOptions {
+  mode: "sub" | "main";
   piPath: string;
   extensionPath: string;
-  model: string;
-  thinking: ThinkingLevel;
+  model?: string;
+  thinking?: ThinkingLevel;
   name: string;
+  projectTrusted: boolean;
   sessionFile?: string;
 }
 
 export function buildPiCommand(options: PiCommandOptions): string[] {
-  const command = [
+  const command = options.mode === "main"
+    ? buildMainPiCommand(options)
+    : buildSubPiCommand(options);
+  if (options.sessionFile) command.push("--session", options.sessionFile);
+  return command;
+}
+
+function buildSubPiCommand(options: PiCommandOptions): string[] {
+  if (!options.model || !options.thinking) throw new Error("Subagent model and thinking are required");
+  return [
     options.piPath,
     "--no-extensions",
     "-e", options.extensionPath,
@@ -163,7 +175,13 @@ export function buildPiCommand(options: PiCommandOptions): string[] {
     "--thinking", options.thinking,
     "--name", options.name,
   ];
-  if (options.sessionFile) command.push("--session", options.sessionFile);
+}
+
+function buildMainPiCommand(options: PiCommandOptions): string[] {
+  const command = [options.piPath, "-e", options.extensionPath];
+  if (options.model) command.push("--model", options.model);
+  if (options.thinking) command.push("--thinking", options.thinking);
+  command.push("--name", options.name, options.projectTrusted ? "--approve" : "--no-approve");
   return command;
 }
 

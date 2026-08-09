@@ -14,7 +14,7 @@ export interface WorkerReady {
 
 export interface WorkerChannel {
   readonly socketPath: string;
-  waitForReady(): Promise<WorkerReady>;
+  waitForReady(timeoutMs?: number): Promise<WorkerReady>;
   send(type: string, payload?: Record<string, unknown>): Promise<void>;
   close(): Promise<void>;
 }
@@ -148,8 +148,8 @@ class SocketWorkerChannel implements WorkerChannel {
     private readonly directory: string,
   ) {}
 
-  waitForReady(): Promise<WorkerReady> {
-    return withTimeout(this.ready.promise, 20_000, "Timed out waiting for subagent readiness");
+  waitForReady(timeoutMs = 20_000): Promise<WorkerReady> {
+    return withTimeout(this.ready.promise, timeoutMs, "Timed out waiting for subagent readiness");
   }
 
   async send(type: string, payload: Record<string, unknown> = {}): Promise<void> {

@@ -1,5 +1,6 @@
 import type { Placement, ThinkingLevel } from "./tmux.js";
 
+export type WorkerMode = "sub" | "main";
 export type RunStatus = "created" | "starting" | "running" | "completed" | "blocked" | "failed" | "cancelled";
 export type PaneState = "open" | "closed" | "disconnected";
 
@@ -12,13 +13,14 @@ export interface SubagentReport {
 }
 
 export interface RunRecord {
-  version: 1;
+  version: 2;
+  mode: WorkerMode;
   runId: string;
   alias: string;
   taskPreview: string;
   cwd: string;
-  model: string;
-  thinking: ThinkingLevel;
+  model?: string;
+  thinking?: ThinkingLevel;
   placement: Placement;
   status: RunStatus;
   paneState: PaneState;
@@ -36,10 +38,11 @@ export interface RunRecord {
 }
 
 export interface StartInput {
+  mode?: WorkerMode;
   task: string;
   alias?: string;
-  model: string;
-  thinking: ThinkingLevel;
+  model?: string;
+  thinking?: ThinkingLevel;
   placement?: Placement;
 }
 
@@ -60,8 +63,9 @@ export interface RunResult {
   tmuxSessionId?: string;
   workerSessionId?: string;
   workerSessionFile?: string;
-  model: string;
-  thinking: ThinkingLevel;
+  mode?: "main";
+  model?: string;
+  thinking?: ThinkingLevel;
   report?: SubagentReport;
   error?: string;
 }
@@ -75,9 +79,10 @@ export function resultFromRun(run: RunRecord): RunResult {
     runId: run.runId,
     alias: run.alias,
     status: run.status,
-    model: run.model,
-    thinking: run.thinking,
   };
+  if (run.mode === "main") result.mode = "main";
+  if (run.model !== undefined) result.model = run.model;
+  if (run.thinking !== undefined) result.thinking = run.thinking;
   if (run.tmuxTarget !== undefined) result.tmuxTarget = run.tmuxTarget;
   if (run.tmuxWindowId !== undefined) result.tmuxWindowId = run.tmuxWindowId;
   if (run.tmuxSessionId !== undefined) result.tmuxSessionId = run.tmuxSessionId;

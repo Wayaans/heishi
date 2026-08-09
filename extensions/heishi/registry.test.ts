@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { reconcileRuns, restoreRunSnapshots } from "./registry.js";
+import { reconcileRuns, restoreRunSnapshots, restoreSessionMode } from "./registry.js";
 import type { RunRecord } from "./types.js";
 
 function makeRunRecord(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
-    version: 1,
+    version: 2,
+    mode: "sub",
     runId: "run-1",
     alias: "Circe",
     taskPreview: "Inspect the checkout",
@@ -33,6 +34,44 @@ describe("run registry restoration", () => {
     ]);
 
     assert.deepEqual(restored, [latest]);
+  });
+
+  it("normalizes legacy version-1 records to sub mode", () => {
+    const legacy = { ...makeRunRecord(), version: 1 } as Record<string, unknown>;
+    delete legacy["mode"];
+
+    const restored = restoreRunSnapshots([
+      { type: "custom", customType: "heishi:subagent-run", data: legacy },
+    ]);
+
+    assert.equal(restored[0]?.version, 2);
+    assert.equal(restored[0]?.mode, "sub");
+  });
+
+  it("rejects persisted records with invalid enum fields", () => {
+    for (const overrides of [
+      { mode: "invalid" },
+      { status: "invalid" },
+      { paneState: "invalid" },
+      { placement: "invalid" },
+      { thinking: "invalid" },
+      { tmuxTarget: 42 },
+      { report: { status: "completed", summary: 42, structured: true } },
+    ]) {
+      const restored = restoreRunSnapshots([
+        { type: "custom", customType: "heishi:subagent-run", data: { ...makeRunRecord(), ...overrides } },
+      ]);
+      assert.deepEqual(restored, []);
+    }
+  });
+
+  it("restores the latest valid mode from the active branch", () => {
+    assert.equal(restoreSessionMode([
+      { type: "custom", customType: "heishi:mode", data: { mode: "main" } },
+      { type: "custom", customType: "heishi:mode", data: { mode: "invalid" } },
+      { type: "custom", customType: "heishi:mode", data: { mode: "sub" } },
+    ]), "sub");
+    assert.equal(restoreSessionMode([]), undefined);
   });
 
   it("marks restored open panes disconnected when tmux no longer has them", async () => {

@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ScopedModel } from "@earendil-works/pi-coding-agent";
-import type { ThinkingLevel } from "./tmux.js";
+import { THINKING_LEVELS, type ThinkingLevel } from "./tmux.js";
 
 export interface DelegationPair {
   model: string;
@@ -26,7 +26,7 @@ export interface LoadedConfig {
   error?: string;
 }
 
-const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const THINKING_LEVEL_SET = new Set<ThinkingLevel>(THINKING_LEVELS);
 
 export async function loadConfig(path: string): Promise<LoadedConfig> {
   if (!existsSync(path)) return { config: { models: [] }, exists: false };
@@ -92,6 +92,21 @@ export function modelReference(model: Pick<Model<any>, "provider" | "id">): stri
   return `${model.provider}/${model.id}`;
 }
 
+export function validateMainOverrides(
+  model: string | undefined,
+  thinking: ThinkingLevel | undefined,
+  availableModels: readonly Model<any>[],
+): void {
+  if (thinking && !model) throw new Error("Main-agent thinking requires an explicit model");
+  if (!model) return;
+
+  const selected = availableModels.find((candidate) => modelReference(candidate) === model);
+  if (!selected) throw new Error(`Main-agent model is not authenticated: ${model}`);
+  if (thinking && !getSupportedThinkingLevels(selected).includes(thinking)) {
+    throw new Error(`Main-agent model ${model} does not support thinking ${thinking}`);
+  }
+}
+
 function parseConfig(value: unknown): DelegationConfig {
   if (!isRecord(value) || !Array.isArray(value["models"])) {
     throw new Error("expected an object with a models array");
@@ -114,7 +129,7 @@ function parseConfig(value: unknown): DelegationConfig {
 }
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
-  return typeof value === "string" && THINKING_LEVELS.has(value as ThinkingLevel);
+  return typeof value === "string" && THINKING_LEVEL_SET.has(value as ThinkingLevel);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

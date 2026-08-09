@@ -2,6 +2,7 @@ import { connect, type Socket } from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { JsonlDecoder, PROTOCOL_VERSION, encodeMessage, type ProtocolEnvelope } from "./protocol.js";
+import type { WorkerMode } from "./types.js";
 
 const SUBAGENT_PROMPT = `You are a delegated subagent running in an isolated Pi session.
 Complete only the task assigned by the parent agent. Work independently and efficiently.
@@ -10,7 +11,12 @@ Follow the loaded AGENTS.md instructions and use available coding tools as neede
 You may receive steering and follow-up tasks from the parent.
 Finish delegated work by calling subagent_report exactly once with outcome, concise summary, verification, blockers, and remaining risks.`;
 
+const MAIN_AGENT_PROMPT = `You are a managed Heishi main agent. Behave as a normal Pi coding agent with all loaded resources.
+You may receive steering and follow-up tasks from the parent.
+When the managed task is complete, prefer \`subagent_report\`; if it is not called, Heishi uses the final assistant response.`;
+
 interface WorkerConfiguration {
+  mode: WorkerMode;
   runId: string;
   token: string;
   socketPath: string;
@@ -30,6 +36,7 @@ export function registerWorkerBridge(pi: ExtensionAPI): void {
   let reportCalled = false;
   let queuedFollowUps = 0;
   let finalAssistantText = "";
+  let bridgeReady = false;
   let shuttingDown = false;
 
   const send = (type: string, payload: Record<string, unknown> = {}): void => {
@@ -40,6 +47,10 @@ export function registerWorkerBridge(pi: ExtensionAPI): void {
       runId: configuration.runId,
       version: PROTOCOL_VERSION,
     }));
+  };
+
+  const sendMetadata = (model: string, thinking: string): void => {
+    if (configuration.mode === "main" && bridgeReady) send("metadata", { model, thinking });
   };
 
   pi.registerTool({
@@ -72,7 +83,7 @@ export function registerWorkerBridge(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\n${SUBAGENT_PROMPT}`,
+    systemPrompt: `${event.systemPrompt}\n\n${workerSystemPrompt(configuration.mode)}`,
   }));
 
   pi.on("session_start", async (_event, ctx) => {
@@ -91,9 +102,18 @@ export function registerWorkerBridge(pi: ExtensionAPI): void {
         sessionId: ctx.sessionManager.getSessionId(),
         sessionFile,
       });
+      bridgeReady = true;
     } catch (error) {
       send("error", { message: errorMessage(error) });
     }
+  });
+
+  pi.on("model_select", (event, ctx) => {
+    if (ctx.thinkingLevel) sendMetadata(`${event.model.provider}/${event.model.id}`, ctx.thinkingLevel);
+  });
+
+  pi.on("thinking_level_select", (event, ctx) => {
+    if (ctx.model) sendMetadata(`${ctx.model.provider}/${ctx.model.id}`, event.level);
   });
 
   pi.on("agent_start", () => {
@@ -198,7 +218,24 @@ function readConfiguration(): WorkerConfiguration {
   const token = process.env["HEISHI_TOKEN"];
   const socketPath = process.env["HEISHI_SOCKET"];
   if (!runId || !token || !socketPath) throw new Error("Subagent bridge configuration is incomplete");
-  return { runId, token, socketPath, resume: process.env["HEISHI_RESUME"] === "1" };
+  return {
+    mode: resolveWorkerMode(process.env),
+    runId,
+    token,
+    socketPath,
+    resume: process.env["HEISHI_RESUME"] === "1",
+  };
+}
+
+export function resolveWorkerMode(environment: Readonly<Record<string, string | undefined>>): WorkerMode {
+  const mode = environment["HEISHI_WORKER_MODE"];
+  if (mode === undefined || mode === "sub") return "sub";
+  if (mode === "main") return "main";
+  throw new Error(`Invalid Heishi worker mode: ${mode}`);
+}
+
+export function workerSystemPrompt(mode: WorkerMode): string {
+  return mode === "main" ? MAIN_AGENT_PROMPT : SUBAGENT_PROMPT;
 }
 
 function requireMessage(message: ProtocolEnvelope, field: "task" | "message"): string {

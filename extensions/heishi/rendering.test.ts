@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { reportMarkdown } from "./rendering.js";
+import { reportMarkdown, runIdentity } from "./rendering.js";
 
 describe("subagent report rendering", () => {
   it("renders every substantive report field once as Markdown", () => {
@@ -17,6 +17,13 @@ describe("subagent report rendering", () => {
     assert.match(markdown, /# Report/u);
     assert.match(markdown, /## Verification\n\n`bun test` passed\./u);
     assert.match(markdown, /## Remaining risk\n\nManual tmux verification remains\./u);
+  });
+
+  it("marks main run identities while leaving sub results unchanged", () => {
+    const base = { runId: "12345678-1234-1234-1234-123456789abc", alias: "Circe", status: "running" as const };
+
+    assert.equal(runIdentity(base), "Circe · 123456");
+    assert.equal(runIdentity({ ...base, mode: "main" }), "Circe · 123456 · main");
   });
 
   it("makes omitted optional fields explicit", () => {
