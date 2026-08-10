@@ -84,7 +84,7 @@ export class RunCoordinator {
       cwd: this.dependencies.cwd,
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
-      placement: input.placement ?? "session",
+      placement: input.placement ?? (mode === "main" ? "window" : "session"),
       status: "created",
       paneState: "closed",
       createdAt: timestamp,

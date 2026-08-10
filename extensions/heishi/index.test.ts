@@ -86,11 +86,12 @@ describe("Heishi tool prompt metadata", () => {
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("`placement` parameter is optional")
         && guideline.includes("Omit it unless the user explicitly requests")
-        && guideline.includes("falls back to `session`");
+        && guideline.includes("defaults to `session` in sub mode")
+        && guideline.includes("`window` in main mode");
     }));
     assert.match(
       start.parameters.properties?.["placement"]?.description ?? "",
-      /Omit unless the user explicitly requests one; omission falls back to session/u,
+      /Omit unless the user explicitly requests one; omission defaults to session in sub mode and window in main mode/u,
     );
     assert.deepEqual(
       start.parameters.properties?.["placement"]?.anyOf?.map((placement) => placement.const),

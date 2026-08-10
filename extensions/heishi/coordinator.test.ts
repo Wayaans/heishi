@@ -161,6 +161,8 @@ describe("run coordinator", () => {
     assert.equal(tmux.launches[0]?.command.includes("--approve"), true);
     assert.equal(tmux.launches[0]?.command.includes("--model"), false);
     assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "main");
+    assert.equal(tmux.launches[0]?.placement, "window");
+    assert.equal(tmux.launches[0]?.sessionName, undefined);
     await coordinator.shutdown();
   });
 
@@ -271,9 +273,8 @@ describe("run coordinator", () => {
     const { coordinator, tmux } = fixture();
 
     await coordinator.start({
+      mode: "main",
       task: "Inspect in the background",
-      model: "openai/model",
-      thinking: "high",
       placement: "session",
     });
 

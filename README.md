@@ -41,7 +41,7 @@ Main workers mirror the parent session's project trust. They load trusted extens
 
 Use `/subagent` to manage workers in the interactive overlay. Both modes prefer structured reports and fall back to the worker's final assistant response.
 
-By default, workers open in a detached window in the `heishi-subagents` tmux session. They can also open in the current tmux session as a pane or detached window.
+By default, sub workers open in a detached window in the `heishi-subagents` tmux session, while main workers open in a detached window in the current tmux session. An explicit placement can open either mode in the background session or in the current tmux session as a pane or detached window.
 
 Subagents share the current checkout. Run concurrent writers only on separate files or worktrees.
 

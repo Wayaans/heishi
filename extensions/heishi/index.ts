@@ -115,7 +115,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "The optional `mode` parameter overrides the current Heishi session default for that run.",
       "Use `sub` mode for bounded delegated work that benefits from the constrained, fast resource profile. Sub mode requires an explicit model/thinking pair from the Heishi delegation pool.",
       "Use `main` mode when the worker needs normal Pi extensions, skills, tools, prompt templates, or unrestricted authenticated-model selection. Main model/thinking overrides are optional.",
-      "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission falls back to `session`.",
+      "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission defaults to `session` in sub mode and `window` in main mode.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
       "After every successful `subagent_start`, use `subagent_control` first only when live interaction is needed, then use `subagent_wait` for every started run; otherwise use `subagent_wait` immediately. Do not inspect, implement, or answer the user until all waits return.",
@@ -131,7 +131,7 @@ export default function heishi(pi: ExtensionAPI): void {
       thinking: Type.Optional(ThinkingSchema),
       placement: Type.Optional(Type.Union(
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
-        { description: "Optional worker placement. Omit unless the user explicitly requests one; omission falls back to session, which opens a detached window in the named heishi-subagents tmux session" },
+        { description: "Optional worker placement. Omit unless the user explicitly requests one; omission defaults to session in sub mode and window in main mode" },
       )),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
