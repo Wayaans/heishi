@@ -16,7 +16,7 @@ Heishi lets Pi delegate work to concurrent agent sessions, steer them while they
 pi install git:github.com/Wayaans/heishi
 ```
 
-Restart Pi, then configure the model and thinking-level pairs available to constrained workers:
+Restart Pi, then configure the delegation pool of model and thinking-level pairs:
 
 ```text
 /heishi model
@@ -33,9 +33,18 @@ Heishi gives Pi three tools:
 Workers have two modes:
 
 - `sub` (default) uses Heishi's fast, constrained resource profile and requires a model/thinking pair configured through `/heishi model`.
-- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. It can use Pi's default authenticated model or optional authenticated model/thinking overrides, and it can delegate recursively.
+- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. It can use any authenticated model explicitly requested by the user. Otherwise, the agent deliberately chooses the best-fitting model/thinking pair from the configured delegation pool instead of selecting randomly or using Pi's default model. It can delegate recursively.
 
-Set the current session's default for future runs with `/heishi mode`, `/heishi mode sub`, or `/heishi mode main`. An explicit `subagent_start.mode` overrides that default for one run. New and forked sessions default to `sub`; existing runs retain their original mode.
+Choose a mode by the task's intended repository side effects, not by keywords:
+
+| Task | Mode |
+| --- | --- |
+| Read-only exploration, research, analysis, audit, review, or a report returned to the parent | `sub` |
+| Implementation, fixes, refactoring, or creating, editing, deleting, formatting, or generating repository files | `main` |
+
+Tell read-only workers not to modify files and to return findings in their final report. For mixed investigation and write work, prefer a sub-mode investigation followed by a main-mode implementation; if the work cannot be split, use `main`. Returning a report through `subagent_wait` is read-only, while saving that report in the repository is write work.
+
+The main agent passes `mode` explicitly after classifying a task. Set the fallback for direct starts with `/heishi mode`, `/heishi mode sub`, or `/heishi mode main`. An explicit `subagent_start.mode` overrides that fallback for one run. New and forked sessions default to `sub`; existing runs retain their original mode.
 
 Main workers mirror the parent session's project trust. They load trusted extensions with normal process permissions and model credentials; they are not sandboxes.
 

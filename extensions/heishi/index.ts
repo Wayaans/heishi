@@ -38,8 +38,21 @@ import { registerWorkerBridge, resolveWorkerMode } from "./worker.js";
 
 const ThinkingSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
-  { description: "Optional thinking level. Required for sub mode; main mode requires a model when thinking is supplied" },
+  { description: "Optional thinking level. Required for sub mode and when main mode chooses from the Heishi delegation pool; an explicitly user-requested main model may omit it" },
 );
+
+const MAIN_MODEL_GUIDELINES = [
+  "In main mode, use any authenticated model explicitly requested by the user, even when it is outside the Heishi delegation pool.",
+  "When the user does not specify a main-mode model, deliberately choose and pass the exact model/thinking pair from the Heishi delegation pool that best fits the task; do not select randomly or rely on Pi's default model.",
+] as const;
+
+const TASK_MODE_GUIDELINES = [
+  "Before every `subagent_start`, classify the task by its intended repository side effects, then pass `mode` explicitly.",
+  "Use `sub` mode for read-only work: exploring, researching, analyzing, auditing, reviewing, or returning a report without creating, editing, or deleting repository files.",
+  "For a read-only task, explicitly tell the worker not to modify files and to return findings in its final report.",
+  "Use `main` mode for write work: implementing, fixing, refactoring, or creating, editing, deleting, formatting, or generating repository files, including documentation and tests.",
+  "For mixed investigation and write work, prefer a sub-mode investigation followed by a main-mode implementation. If the work cannot be split, use main mode.",
+] as const;
 
 export default function heishi(pi: ExtensionAPI): void {
   const workerMode = process.env["HEISHI_WORKER"] === "1"
@@ -107,14 +120,16 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_start",
     label: "Start Subagent",
-    description: "Start an asynchronous persistent worker in sub or main mode. Sub is constrained and requires an allowed model/thinking pair; main loads normal Pi resources and accepts optional authenticated-model overrides.",
+    description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main uses an explicitly user-requested authenticated model or a deliberately selected pair from the Heishi delegation pool.",
     promptSnippet: "Start persistent interactive tmux subagents for delegated work",
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
       "Give `subagent_start` a self-contained task because the subagent does not receive the parent conversation.",
       "The optional `mode` parameter overrides the current Heishi session default for that run.",
-      "Use `sub` mode for bounded delegated work that benefits from the constrained, fast resource profile. Sub mode requires an explicit model/thinking pair from the Heishi delegation pool.",
-      "Use `main` mode when the worker needs normal Pi extensions, skills, tools, prompt templates, or unrestricted authenticated-model selection. Main model/thinking overrides are optional.",
+      ...TASK_MODE_GUIDELINES,
+      "Sub mode uses the constrained, fast resource profile and requires an explicit model/thinking pair from the Heishi delegation pool.",
+      "Main mode loads normal Pi extensions, skills, tools, and prompt templates.",
+      ...MAIN_MODEL_GUIDELINES,
       "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission defaults to `session` in sub mode and `window` in main mode.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
@@ -123,11 +138,11 @@ export default function heishi(pi: ExtensionAPI): void {
     parameters: Type.Object({
       mode: Type.Optional(Type.Union(
         [Type.Literal("sub"), Type.Literal("main")],
-        { description: "Optional worker mode. Explicit mode overrides the current session default" },
+        { description: "Optional worker mode. Pass sub for read-only work or main for repository writes; omission uses the current session default" },
       )),
       task: Type.String({ description: "Self-contained delegated task, including all context the subagent needs from the parent conversation" }),
       alias: Type.Optional(Type.String({ description: "Optional display alias; if omitted, a Greek mythological name is chosen" })),
-      model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode; optional authenticated-model override in main mode" })),
+      model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode. In main mode, use an explicitly user-requested authenticated model or choose a model/thinking pair from the Heishi delegation pool" })),
       thinking: Type.Optional(ThinkingSchema),
       placement: Type.Optional(Type.Union(
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
@@ -194,6 +209,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "After `subagent_wait` returns, the worker is settled and auto-closed. Use `subagent_control` with `resume` before assigning new work with `prompt` or `follow_up`.",
       "Use `steer` only while a subagent is actively running and connected; do not use `steer` after `subagent_wait`. Resume it and use `prompt` or `follow_up` instead.",
       "After `prompt`, `follow_up`, or `steer`, use `subagent_wait` before the main agent inspects, implements, or answers with the delegated result.",
+      "Do not assign write work to a sub-mode run through `prompt`, `follow_up`, or `steer`; start a main-mode run instead.",
     ],
     parameters: Type.Object({
       runId: Type.String({ description: "Full authoritative run UUID returned by subagent_start" }),
@@ -280,13 +296,15 @@ export default function heishi(pi: ExtensionAPI): void {
       "Omitting subagent_start.mode uses this default. An explicit mode overrides it for that run.",
     ].join("\n");
     const poolGuidance = pairs.length === 0
-      ? "Heishi sub mode is disabled until the user configures /heishi model. Main mode remains available."
+      ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode remains available when the user explicitly requests an authenticated model."
       : [
-          "Heishi sub mode must use one of these exact model/thinking pairs:",
+          "The Heishi delegation pool contains these exact model/thinking pairs:",
           ...pairs.map((pair) => `- ${pair.model} / ${pair.thinking}`),
-          "These pairs restrict only sub mode. Choose the pair that best fits each sub-mode task and pass both values explicitly. Do not resume or assign new work to an existing sub-mode run whose pair is not listed.",
+          "Sub mode must use one of these pairs. Do not resume or assign new work to an existing sub-mode run whose pair is not listed.",
         ].join("\n");
-    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${poolGuidance}` };
+    const taskModeGuidance = TASK_MODE_GUIDELINES.join("\n");
+    const mainModelGuidance = MAIN_MODEL_GUIDELINES.join("\n");
+    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${mainModelGuidance}\n${poolGuidance}` };
   });
 
   pi.registerCommand("heishi", {

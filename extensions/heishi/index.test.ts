@@ -65,6 +65,39 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("concurrently");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("classify the task by its intended repository side effects")
+        && guideline.includes("pass `mode` explicitly");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("Use `sub` mode for read-only work")
+        && guideline.includes("without creating, editing, or deleting repository files");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("Use `main` mode for write work")
+        && guideline.includes("documentation and tests");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("mixed investigation and write work")
+        && guideline.includes("sub-mode investigation followed by a main-mode implementation")
+        && guideline.includes("use main mode");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("read-only task")
+        && guideline.includes("not to modify files")
+        && guideline.includes("final report");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("any authenticated model explicitly requested by the user")
+        && guideline.includes("outside the Heishi delegation pool");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("user does not specify a main-mode model")
+        && guideline.includes("exact model/thinking pair")
+        && guideline.includes("best fits the task")
+        && guideline.includes("do not select randomly")
+        && guideline.includes("Pi's default model");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("use `subagent_control` first only when live interaction is needed")
         && guideline.includes("otherwise use `subagent_wait` immediately")
         && guideline.includes("Do not inspect, implement, or answer");
@@ -82,6 +115,10 @@ describe("Heishi tool prompt metadata", () => {
     assert.ok(control.promptGuidelines?.some((guideline) => {
       return guideline.includes("After `prompt`, `follow_up`, or `steer`")
         && guideline.includes("`subagent_wait`");
+    }));
+    assert.ok(control.promptGuidelines?.some((guideline) => {
+      return guideline.includes("Do not assign write work to a sub-mode run")
+        && guideline.includes("start a main-mode run instead");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("`placement` parameter is optional")
@@ -108,6 +145,36 @@ describe("Heishi tool prompt metadata", () => {
     assert.equal(start.parameters.required?.includes("model") ?? false, false);
     assert.equal(start.parameters.required?.includes("thinking") ?? false, false);
     assert.deepEqual(tools.map((tool) => tool.name), ["subagent_start", "subagent_control", "subagent_wait"]);
+  });
+
+  it("injects the mode and main-model selection policies into the main agent prompt", () => {
+    type BeforeAgentStart = (
+      event: { systemPrompt: string },
+      ctx: { modelRegistry: { getAvailable(): Model<any>[] }; scopedModels: [] },
+    ) => { systemPrompt: string };
+    let beforeAgentStart: BeforeAgentStart | undefined;
+    const pi = {
+      on(event: string, handler: unknown) {
+        if (event === "before_agent_start") beforeAgentStart = handler as BeforeAgentStart;
+      },
+      registerCommand() {},
+      registerTool() {},
+    } as unknown as ExtensionAPI;
+
+    heishi(pi);
+    assert.ok(beforeAgentStart);
+    const result = beforeAgentStart(
+      { systemPrompt: "Base prompt" },
+      { modelRegistry: { getAvailable: () => [] }, scopedModels: [] },
+    );
+
+    assert.match(result.systemPrompt, /classify the task by its intended repository side effects/u);
+    assert.match(result.systemPrompt, /Use `sub` mode for read-only work/u);
+    assert.match(result.systemPrompt, /Use `main` mode for write work/u);
+    assert.match(result.systemPrompt, /pass `mode` explicitly/u);
+    assert.match(result.systemPrompt, /any authenticated model explicitly requested by the user/u);
+    assert.match(result.systemPrompt, /user does not specify a main-mode model/u);
+    assert.match(result.systemPrompt, /do not select randomly or rely on Pi's default model/u);
   });
 
   it("toggles and persists the session default mode", async () => {
