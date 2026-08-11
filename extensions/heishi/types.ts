@@ -4,11 +4,22 @@ export type WorkerMode = "sub" | "main";
 export type RunStatus = "created" | "starting" | "running" | "completed" | "blocked" | "failed" | "cancelled";
 export type PaneState = "open" | "closed" | "disconnected";
 
+export type ExternalInputKind = "question" | "confirmation" | "decision" | "missing_context" | "permission";
+
+export interface ExternalInputRequest {
+  kind: ExternalInputKind;
+  prompt: string;
+  detail?: string;
+  options?: string[];
+  recommendation?: string;
+}
+
 export interface SubagentReport {
   status: "completed" | "blocked" | "failed";
   summary: string;
   verification?: string;
   remainingRisk?: string;
+  request?: ExternalInputRequest;
   structured: boolean;
 }
 

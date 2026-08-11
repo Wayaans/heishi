@@ -54,6 +54,12 @@ const TASK_MODE_GUIDELINES = [
   "For mixed investigation and write work, prefer a sub-mode investigation followed by a main-mode implementation. If the work cannot be split, use main mode.",
 ] as const;
 
+const DELEGATION_BRIEF_GUIDELINES = [
+  "A `subagent_start` worker starts in a fresh session and receives none of the parent conversation, prior tool results, assumptions, decisions, or user messages.",
+  "Every `subagent_start.task` must be self-contained: include the objective, relevant background and decisions, exact scope and exclusions, important file paths or symbols, constraints and assumptions, expected deliverable, and required verification.",
+  "Never write a `subagent_start.task` that relies on references such as ‘as discussed above’, ‘continue this’, or ‘inspect the issue’ without reproducing the necessary context.",
+] as const;
+
 export default function heishi(pi: ExtensionAPI): void {
   const workerMode = process.env["HEISHI_WORKER"] === "1"
     ? resolveWorkerMode(process.env)
@@ -124,7 +130,7 @@ export default function heishi(pi: ExtensionAPI): void {
     promptSnippet: "Start persistent interactive tmux subagents for delegated work",
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
-      "Give `subagent_start` a self-contained task because the subagent does not receive the parent conversation.",
+      ...DELEGATION_BRIEF_GUIDELINES,
       "The optional `mode` parameter overrides the current Heishi session default for that run.",
       ...TASK_MODE_GUIDELINES,
       "Sub mode uses the constrained, fast resource profile and requires an explicit model/thinking pair from the Heishi delegation pool.",
@@ -140,7 +146,7 @@ export default function heishi(pi: ExtensionAPI): void {
         [Type.Literal("sub"), Type.Literal("main")],
         { description: "Optional worker mode. Pass sub for read-only work or main for repository writes; omission uses the current session default" },
       )),
-      task: Type.String({ description: "Self-contained delegated task, including all context the subagent needs from the parent conversation" }),
+      task: Type.String({ description: "Self-contained delegated brief with objective, background and decisions, scope and exclusions, relevant paths or symbols, constraints and assumptions, expected deliverable, and verification; the worker receives no parent conversation" }),
       alias: Type.Optional(Type.String({ description: "Optional display alias; if omitted, a Greek mythological name is chosen" })),
       model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode. In main mode, use an explicitly user-requested authenticated model or choose a model/thinking pair from the Heishi delegation pool" })),
       thinking: Type.Optional(ThinkingSchema),
@@ -252,6 +258,7 @@ export default function heishi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use `subagent_wait` with the full run UUID after every successful `subagent_start` and after `subagent_control` starts or changes work; waiting is mandatory before the main agent inspects, implements, or answers with the delegated result.",
       "Treat the result of `subagent_wait`, which waits for `agent_settled`, as completion; do not infer completion from tmux pane output or `agent_end`.",
+      "When `subagent_wait` returns a blocked report with a structured request, obtain the requested external input in the parent session, resume the worker, send the answer with `subagent_control` action `prompt`, and call `subagent_wait` again.",
     ],
     parameters: Type.Object({
       runId: Type.String({ description: "Full authoritative run UUID returned by subagent_start" }),
@@ -303,8 +310,9 @@ export default function heishi(pi: ExtensionAPI): void {
           "Sub mode must use one of these pairs. Do not resume or assign new work to an existing sub-mode run whose pair is not listed.",
         ].join("\n");
     const taskModeGuidance = TASK_MODE_GUIDELINES.join("\n");
+    const delegationBriefGuidance = DELEGATION_BRIEF_GUIDELINES.join("\n");
     const mainModelGuidance = MAIN_MODEL_GUIDELINES.join("\n");
-    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${mainModelGuidance}\n${poolGuidance}` };
+    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${poolGuidance}` };
   });
 
   pi.registerCommand("heishi", {

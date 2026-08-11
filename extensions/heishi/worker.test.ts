@@ -2,13 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { resolveWorkerMode, workerSystemPrompt } from "./worker.js";
 
-const EXISTING_SUBAGENT_PROMPT = `You are a delegated subagent running in an isolated Pi session.
-Complete only the task assigned by the parent agent. Work independently and efficiently.
-Do not delegate to additional subagents.
-Follow the loaded AGENTS.md instructions and use available coding tools as needed.
-You may receive steering and follow-up tasks from the parent.
-Finish delegated work by calling subagent_report exactly once with outcome, concise summary, verification, blockers, and remaining risks.`;
-
 describe("worker mode bootstrap", () => {
   it("keeps missing worker mode compatible with constrained sub workers", () => {
     assert.equal(resolveWorkerMode({}), "sub");
@@ -16,13 +9,25 @@ describe("worker mode bootstrap", () => {
     assert.throws(() => resolveWorkerMode({ HEISHI_WORKER_MODE: "invalid" }), /Invalid Heishi worker mode/u);
   });
 
-  it("preserves the exact sub prompt", () => {
-    assert.equal(workerSystemPrompt("sub"), EXISTING_SUBAGENT_PROMPT);
+  it("makes sub workers explicitly parent-facing and context-isolated", () => {
+    const prompt = workerSystemPrompt("sub");
+
+    assert.match(prompt, /delegated worker, not a user-facing agent/u);
+    assert.match(prompt, /only external communication channel is the parent agent/u);
+    assert.match(prompt, /fresh, isolated session/u);
+    assert.match(prompt, /do not have the parent conversation/u);
+    assert.match(prompt, /Do not ask the user questions/u);
+    assert.match(prompt, /status `blocked` and a structured `request`/u);
+    assert.match(prompt, /Do not delegate to additional subagents/u);
   });
 
-  it("gives main workers only the managed reporting contract", () => {
+  it("gives main workers the same delegation contract plus normal resources", () => {
     const prompt = workerSystemPrompt("main");
 
+    assert.match(prompt, /delegated worker, not a user-facing agent/u);
+    assert.match(prompt, /only external communication channel is the parent agent/u);
+    assert.match(prompt, /do not have the parent conversation/u);
+    assert.match(prompt, /Do not ask the user questions/u);
     assert.match(prompt, /normal Pi coding agent with all loaded resources/u);
     assert.match(prompt, /prefer `subagent_report`/u);
     assert.match(prompt, /final assistant response/u);

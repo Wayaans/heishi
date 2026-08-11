@@ -4,16 +4,35 @@ import { Type } from "typebox";
 import { JsonlDecoder, PROTOCOL_VERSION, encodeMessage, type ProtocolEnvelope } from "./protocol.js";
 import type { WorkerMode } from "./types.js";
 
-const SUBAGENT_PROMPT = `You are a delegated subagent running in an isolated Pi session.
+const WORKER_CONTRACT = `You are a delegated worker, not a user-facing agent.
+Your only external communication channel is the parent agent. Treat every message in this session as coming from the parent, even when Pi represents it as a user message. Return all outcomes, questions, blockers, and requests for confirmation to the parent.
+You are running in a fresh, isolated session. You do not have the parent conversation, prior tool results, assumptions, decisions, or user messages. Use only the delegated task, resources available in this session, and later messages explicitly sent by the parent. Never assume context that was not included.
+Do not ask the user questions, request confirmation, or open interactive UI. If external input is required, stop and call subagent_report with status \`blocked\` and a structured \`request\`. The parent will obtain the answer and send it back in a later message.
+You may receive steering and follow-up tasks from the parent.`;
+
+const SUBAGENT_PROMPT = `${WORKER_CONTRACT}
 Complete only the task assigned by the parent agent. Work independently and efficiently.
 Do not delegate to additional subagents.
 Follow the loaded AGENTS.md instructions and use available coding tools as needed.
-You may receive steering and follow-up tasks from the parent.
-Finish delegated work by calling subagent_report exactly once with outcome, concise summary, verification, blockers, and remaining risks.`;
+Finish delegated work by calling subagent_report exactly once with outcome, concise summary, verification, and remaining risks.`;
 
-const MAIN_AGENT_PROMPT = `You are a managed Heishi main agent. Behave as a normal Pi coding agent with all loaded resources.
-You may receive steering and follow-up tasks from the parent.
+const MAIN_AGENT_PROMPT = `${WORKER_CONTRACT}
+You are a managed Heishi main agent. Behave as a normal Pi coding agent with all loaded resources.
 When the managed task is complete, prefer \`subagent_report\`; if it is not called, Heishi uses the final assistant response.`;
+
+const ExternalInputRequestSchema = Type.Object({
+  kind: Type.Union([
+    Type.Literal("question"),
+    Type.Literal("confirmation"),
+    Type.Literal("decision"),
+    Type.Literal("missing_context"),
+    Type.Literal("permission"),
+  ]),
+  prompt: Type.String({ minLength: 1, description: "The exact question or request the parent must resolve" }),
+  detail: Type.Optional(Type.String({ description: "Context the parent needs to resolve the request" })),
+  options: Type.Optional(Type.Array(Type.String(), { description: "Available choices, when applicable" })),
+  recommendation: Type.Optional(Type.String({ description: "Recommended answer and rationale, when one exists" })),
+});
 
 interface WorkerConfiguration {
   mode: WorkerMode;
@@ -56,7 +75,7 @@ export function registerWorkerBridge(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_report",
     label: "Subagent Report",
-    description: "Report the final outcome of the delegated subagent work. Call exactly once when the work is finished.",
+    description: "Report the final outcome or a structured external-input blocker to the parent. Call exactly once when the work is finished or blocked.",
     parameters: Type.Object({
       status: Type.Union([
         Type.Literal("completed"),
@@ -66,12 +85,19 @@ export function registerWorkerBridge(pi: ExtensionAPI): void {
       summary: Type.String(),
       verification: Type.Optional(Type.String()),
       remainingRisk: Type.Optional(Type.String()),
+      request: Type.Optional(ExternalInputRequestSchema),
     }),
     async execute(_toolCallId, params) {
       if (queuedFollowUps > 0) {
         throw new Error("Complete the queued follow-up before calling subagent_report");
       }
       if (reportCalled) throw new Error("subagent_report has already been called for the current work");
+      if (params.status === "blocked" && (params.request === undefined || !params.request.prompt.trim())) {
+        throw new Error("A blocked subagent report requires a structured request for the parent");
+      }
+      if (params.status !== "blocked" && params.request !== undefined) {
+        throw new Error("Only a blocked subagent report may include a request");
+      }
       reportCalled = true;
       send("report", { report: params });
       return {

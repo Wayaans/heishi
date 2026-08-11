@@ -26,13 +26,24 @@ describe("subagent report rendering", () => {
     assert.equal(runIdentity({ ...base, mode: "main" }), "Circe · 123456 · main");
   });
 
-  it("makes omitted optional fields explicit", () => {
+  it("renders blocked external-input requests and makes other omitted fields explicit", () => {
     const markdown = reportMarkdown({
       status: "blocked",
       summary: "Missing project information.",
+      request: {
+        kind: "missing_context",
+        prompt: "Which deployment environment is in scope?",
+        options: ["staging", "production"],
+        recommendation: "Use staging for the first verification run.",
+      },
       structured: true,
     });
 
+    assert.match(markdown, /## External input required/u);
+    assert.match(markdown, /Kind: missing_context/u);
+    assert.match(markdown, /Which deployment environment is in scope\?/u);
+    assert.match(markdown, /- staging\n- production/u);
+    assert.match(markdown, /Recommendation: Use staging/u);
     assert.match(markdown, /## Verification\n\nNot provided\./u);
     assert.match(markdown, /## Remaining risk\n\nNone reported\./u);
   });

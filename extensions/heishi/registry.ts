@@ -121,11 +121,26 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
 function isSubagentReport(value: unknown): value is SubagentReport {
   if (typeof value !== "object" || value === null) return false;
   const report = value as Record<string, unknown>;
-  return isOneOf(report["status"], ["completed", "blocked", "failed"])
+  const status = report["status"];
+  const hasValidRequest = isExternalInputRequest(report["request"]);
+  return isOneOf(status, ["completed", "blocked", "failed"])
     && typeof report["summary"] === "string"
     && typeof report["structured"] === "boolean"
     && (report["verification"] === undefined || typeof report["verification"] === "string")
-    && (report["remainingRisk"] === undefined || typeof report["remainingRisk"] === "string");
+    && (report["remainingRisk"] === undefined || typeof report["remainingRisk"] === "string")
+    && (status === "blocked" ? hasValidRequest : report["request"] === undefined);
+}
+
+function isExternalInputRequest(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const request = value as Record<string, unknown>;
+  return isOneOf(request["kind"], ["question", "confirmation", "decision", "missing_context", "permission"])
+    && typeof request["prompt"] === "string"
+    && request["prompt"].trim().length > 0
+    && (request["detail"] === undefined || typeof request["detail"] === "string")
+    && (request["recommendation"] === undefined || typeof request["recommendation"] === "string")
+    && (request["options"] === undefined
+      || (Array.isArray(request["options"]) && request["options"].every((option) => typeof option === "string")));
 }
 
 function isOneOf<T extends string>(value: unknown, choices: readonly T[]): value is T {

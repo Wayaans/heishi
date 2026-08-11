@@ -54,6 +54,12 @@ By default, sub workers open in a detached window in the `heishi-subagents` tmux
 
 Subagents share the current checkout. Run concurrent writers only on separate files or worktrees.
 
+### Delegation contract
+
+Every worker runs in a fresh session without the parent conversation, prior tool results, assumptions, or decisions. A `subagent_start.task` must therefore be a self-contained brief with the objective, relevant background, scope, constraints, expected deliverable, and verification. Heishi marks messages as delegations from the parent and instructs workers to return all communication to that parent rather than addressing the user.
+
+When a worker needs human or other external input, it reports `status: "blocked"` with a structured `request` containing the request kind, exact prompt, and optional detail, choices, and recommendation. `subagent_wait` returns that request to the parent. The parent can obtain the answer, resume the worker, send the answer with `subagent_control`, and wait again.
+
 ## Development
 
 ```sh

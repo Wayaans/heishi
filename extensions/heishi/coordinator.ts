@@ -6,6 +6,7 @@ import { buildPiCommand, THINKING_LEVELS, type ThinkingLevel, type TmuxAdapter }
 import {
   resultFromRun,
   type ControlInput,
+  type ExternalInputRequest,
   type RunRecord,
   type RunResult,
   type StartInput,
@@ -16,6 +17,9 @@ import {
 
 const SUBAGENT_SESSION_NAME = "heishi-subagents";
 const MAIN_READINESS_TIMEOUT_MS = 60_000;
+const DELEGATION_HEADER = `[Delegation from parent agent]
+This is a fresh session. You do not have the parent conversation.
+The complete task brief follows:`;
 
 const MYTHOLOGICAL_NAMES = [
   "Achilles", "Andromeda", "Ariadne", "Atalanta", "Cassandra", "Circe", "Daedalus", "Electra",
@@ -129,7 +133,7 @@ export class RunCoordinator {
       });
       verifyInitialReady(run, ready, input.model, input.thinking);
       this.update(run, { model: ready.model, thinking: parseThinkingLevel(ready.thinking) });
-      await channel.send("task", { task: input.task });
+      await channel.send("task", { task: `${DELEGATION_HEADER}\n\n${input.task}` });
       throwIfAborted(signal);
       this.update(run, { status: "running", startedAt: this.now() });
       return resultFromRun(run);
@@ -523,9 +527,43 @@ function parseReport(value: unknown): SubagentReport {
   if ((status !== "completed" && status !== "blocked" && status !== "failed") || typeof summary !== "string") {
     throw new Error("Subagent report is malformed");
   }
+  const request = report["request"] === undefined ? undefined : parseExternalInputRequest(report["request"]);
+  if (status === "blocked" && request === undefined) {
+    throw new Error("Blocked subagent report is missing its external input request");
+  }
+  if (status !== "blocked" && request !== undefined) {
+    throw new Error("Only a blocked subagent report may include an external input request");
+  }
+
   const parsed: SubagentReport = { status, summary, structured: true };
   if (typeof report["verification"] === "string") parsed.verification = report["verification"];
   if (typeof report["remainingRisk"] === "string") parsed.remainingRisk = report["remainingRisk"];
+  if (request !== undefined) parsed.request = request;
+  return parsed;
+}
+
+function parseExternalInputRequest(value: unknown): ExternalInputRequest {
+  if (typeof value !== "object" || value === null) throw new Error("Subagent external input request is malformed");
+  const request = value as Record<string, unknown>;
+  const kind = request["kind"];
+  const prompt = request["prompt"];
+  if (
+    (kind !== "question" && kind !== "confirmation" && kind !== "decision"
+      && kind !== "missing_context" && kind !== "permission")
+    || typeof prompt !== "string"
+    || !prompt.trim()
+    || (request["detail"] !== undefined && typeof request["detail"] !== "string")
+    || (request["recommendation"] !== undefined && typeof request["recommendation"] !== "string")
+    || (request["options"] !== undefined
+      && (!Array.isArray(request["options"]) || !request["options"].every((option) => typeof option === "string")))
+  ) {
+    throw new Error("Subagent external input request is malformed");
+  }
+
+  const parsed: ExternalInputRequest = { kind, prompt };
+  if (typeof request["detail"] === "string") parsed.detail = request["detail"];
+  if (Array.isArray(request["options"])) parsed.options = request["options"] as string[];
+  if (typeof request["recommendation"] === "string") parsed.recommendation = request["recommendation"];
   return parsed;
 }
 

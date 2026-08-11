@@ -65,6 +65,22 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("concurrently");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("fresh session")
+        && guideline.includes("none of the parent conversation")
+        && guideline.includes("prior tool results");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("Every `subagent_start.task` must be self-contained")
+        && guideline.includes("objective")
+        && guideline.includes("expected deliverable")
+        && guideline.includes("required verification");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("as discussed above")
+        && guideline.includes("reproducing the necessary context");
+    }));
+    assert.match(start.parameters.properties?.["task"]?.description ?? "", /worker receives no parent conversation/u);
+    assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("classify the task by its intended repository side effects")
         && guideline.includes("pass `mode` explicitly");
     }));
@@ -115,6 +131,12 @@ describe("Heishi tool prompt metadata", () => {
     assert.ok(control.promptGuidelines?.some((guideline) => {
       return guideline.includes("After `prompt`, `follow_up`, or `steer`")
         && guideline.includes("`subagent_wait`");
+    }));
+    assert.ok(wait.promptGuidelines?.some((guideline) => {
+      return guideline.includes("blocked report with a structured request")
+        && guideline.includes("obtain the requested external input in the parent session")
+        && guideline.includes("resume the worker")
+        && guideline.includes("call `subagent_wait` again");
     }));
     assert.ok(control.promptGuidelines?.some((guideline) => {
       return guideline.includes("Do not assign write work to a sub-mode run")
@@ -169,6 +191,8 @@ describe("Heishi tool prompt metadata", () => {
     );
 
     assert.match(result.systemPrompt, /classify the task by its intended repository side effects/u);
+    assert.match(result.systemPrompt, /fresh session and receives none of the parent conversation/u);
+    assert.match(result.systemPrompt, /Every `subagent_start\.task` must be self-contained/u);
     assert.match(result.systemPrompt, /Use `sub` mode for read-only work/u);
     assert.match(result.systemPrompt, /Use `main` mode for write work/u);
     assert.match(result.systemPrompt, /pass `mode` explicitly/u);

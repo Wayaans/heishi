@@ -129,7 +129,16 @@ describe("run coordinator", () => {
     assert.equal(started.tmuxSessionId, "$1");
     assert.equal(tmux.launches[0]?.placement, "session");
     assert.equal(tmux.launches[0]?.sessionName, "heishi-subagents");
-    assert.deepEqual((ipc.channel).sent[0], { type: "task", payload: { task: "Inspect the repository" } });
+    assert.deepEqual((ipc.channel).sent[0], {
+      type: "task",
+      payload: {
+        task: `[Delegation from parent agent]
+This is a fresh session. You do not have the parent conversation.
+The complete task brief follows:
+
+Inspect the repository`,
+      },
+    });
     assert.equal(tmux.launches[0]?.command.includes("--no-context-files"), false);
     assert.equal(tmux.launches[0]?.command.includes("--no-session"), false);
     assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "sub");
@@ -163,6 +172,46 @@ describe("run coordinator", () => {
     assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "main");
     assert.equal(tmux.launches[0]?.placement, "window");
     assert.equal(tmux.launches[0]?.sessionName, undefined);
+    await coordinator.shutdown();
+  });
+
+  it("returns structured external-input requests from blocked workers", async () => {
+    const { coordinator, ipc } = fixture();
+    const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+    const request = {
+      kind: "decision" as const,
+      prompt: "Which retention period should be used?",
+      detail: "The specification permits either value.",
+      options: ["30 days", "90 days"],
+      recommendation: "Use 90 days because it matches the current policy.",
+    };
+
+    await ipc.emit({
+      type: "report",
+      runId: started.runId,
+      version: 1,
+      report: { status: "blocked", summary: "A product decision is required.", request },
+    });
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1 });
+
+    const blocked = await coordinator.wait(started.runId);
+    assert.equal(blocked.status, "blocked");
+    assert.deepEqual(blocked.report?.request, request);
+  });
+
+  it("rejects blocked reports without a structured external-input request", async () => {
+    const { coordinator, ipc } = fixture();
+    const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+
+    await assert.rejects(
+      () => ipc.emit({
+        type: "report",
+        runId: started.runId,
+        version: 1,
+        report: { status: "blocked", summary: "Need input" },
+      }),
+      /missing its external input request/u,
+    );
     await coordinator.shutdown();
   });
 
