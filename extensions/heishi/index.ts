@@ -56,6 +56,7 @@ const TASK_MODE_GUIDELINES = [
 
 const DELEGATION_BRIEF_GUIDELINES = [
   "A `subagent_start` worker starts in a fresh session and receives none of the parent conversation, prior tool results, assumptions, decisions, or user messages.",
+  "Before composing `subagent_start.task`, load and follow the `writing-for-agents` skill when it is available. If it is unavailable, continue without it.",
   "Every `subagent_start.task` must be self-contained: include the objective, relevant background and decisions, exact scope and exclusions, important file paths or symbols, constraints and assumptions, expected deliverable, and required verification.",
   "Never write a `subagent_start.task` that relies on references such as ‘as discussed above’, ‘continue this’, or ‘inspect the issue’ without reproducing the necessary context.",
 ] as const;

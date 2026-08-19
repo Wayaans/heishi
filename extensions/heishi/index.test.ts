@@ -70,6 +70,11 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("prior tool results");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("load and follow the `writing-for-agents` skill")
+        && guideline.includes("when it is available")
+        && guideline.includes("continue without it");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("Every `subagent_start.task` must be self-contained")
         && guideline.includes("objective")
         && guideline.includes("expected deliverable")
@@ -192,6 +197,7 @@ describe("Heishi tool prompt metadata", () => {
 
     assert.match(result.systemPrompt, /classify the task by its intended repository side effects/u);
     assert.match(result.systemPrompt, /fresh session and receives none of the parent conversation/u);
+    assert.match(result.systemPrompt, /load and follow the `writing-for-agents` skill when it is available/u);
     assert.match(result.systemPrompt, /Every `subagent_start\.task` must be self-contained/u);
     assert.match(result.systemPrompt, /Use `sub` mode for read-only work/u);
     assert.match(result.systemPrompt, /Use `main` mode for write work/u);
