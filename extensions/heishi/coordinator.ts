@@ -2,7 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
 import type { ProtocolEnvelope } from "./protocol.js";
 import { isActive } from "./registry.js";
-import { buildPiCommand, THINKING_LEVELS, type ThinkingLevel, type TmuxAdapter } from "./tmux.js";
+import { buildPiCommand, THINKING_LEVELS, type ThinkingLevel, type TmuxAdapter, type TmuxTarget } from "./tmux.js";
 import {
   resultFromRun,
   type ControlInput,
@@ -14,6 +14,8 @@ import {
   type WaitResult,
   type WorkerMode,
 } from "./types.js";
+import { WorktreeOperationError, worktreeCwd, type WorktreeAdapter } from "./worktree.js";
+import { resolveWorkspace } from "./workspace.js";
 
 const SUBAGENT_SESSION_NAME = "heishi-subagents";
 const MAIN_READINESS_TIMEOUT_MS = 60_000;
@@ -32,6 +34,7 @@ export interface CoordinatorDependencies {
   piPath: string;
   tmux: TmuxAdapter;
   ipc: IpcAdapter;
+  worktrees: WorktreeAdapter;
   persist(record: RunRecord): void;
   projectTrusted: boolean;
   newRunId?: () => string;
@@ -53,6 +56,17 @@ interface Runtime {
   aborting: boolean;
 }
 
+interface StartOperation {
+  cancellationRequested: boolean;
+  settled: Deferred;
+}
+
+interface LifecycleOperation {
+  action: "cleanup" | "resume";
+  cancellationRequested: boolean;
+  settled: Deferred;
+}
+
 type RunChanges = Omit<Partial<RunRecord>, "report" | "error"> & {
   report?: SubagentReport | undefined;
   error?: string | undefined;
@@ -61,10 +75,13 @@ type RunChanges = Omit<Partial<RunRecord>, "report" | "error"> & {
 export class RunCoordinator {
   private readonly runs = new Map<string, RunRecord>();
   private readonly runtimes = new Map<string, Runtime>();
+  private readonly startOperations = new Map<string, StartOperation>();
+  private readonly lifecycleOperations = new Map<string, LifecycleOperation>();
   private readonly newRunId: () => string;
   private readonly newToken: () => string;
   private readonly chooseAlias: () => string;
   private readonly now: () => string;
+  private shuttingDown = false;
 
   constructor(private readonly dependencies: CoordinatorDependencies) {
     this.newRunId = dependencies.newRunId ?? randomUUID;
@@ -74,14 +91,18 @@ export class RunCoordinator {
   }
 
   async start(input: StartInput, signal?: AbortSignal): Promise<RunResult> {
-    const mode = validateStart(input);
+    if (this.shuttingDown) throw new Error("Cannot start while the subagent coordinator is shutting down");
+    const mode = input.mode ?? "sub";
+    const workspace = resolveWorkspace(mode, input.workspace);
+    validateStart(input);
     if (signal?.aborted) throw new Error("Subagent start was cancelled");
 
     const runId = this.newRunId();
     const timestamp = this.now();
     const run: RunRecord = {
-      version: 2,
+      version: 3,
       mode,
+      workspace,
       runId,
       alias: resolveAlias(input.alias, this.chooseAlias),
       taskPreview: preview(input.task),
@@ -96,12 +117,23 @@ export class RunCoordinator {
     };
     this.runs.set(runId, run);
     this.persist(run);
+    const startOperation = createStartOperation();
+    this.startOperations.set(runId, startOperation);
 
     let abortListener: (() => void) | undefined;
+    let launchAttempted = false;
     try {
+      throwIfStartCancelled(startOperation, signal);
       await this.dependencies.tmux.validate();
-      throwIfAborted(signal);
+      throwIfStartCancelled(startOperation, signal);
       this.update(run, { status: "starting" });
+      if (run.workspace === "worktree") {
+        throwIfStartCancelled(startOperation, signal);
+        const worktree = await this.dependencies.worktrees.prepare(run.cwd, run.runId);
+        this.update(run, { worktree });
+        throwIfStartCancelled(startOperation, signal);
+      }
+      throwIfStartCancelled(startOperation, signal);
       const token = this.newToken();
       const channel = await this.dependencies.ipc.open(
         runId,
@@ -116,45 +148,69 @@ export class RunCoordinator {
         aborting: false,
       };
       this.runtimes.set(runId, runtime);
-      throwIfAborted(signal);
+      throwIfStartCancelled(startOperation, signal);
 
+      launchAttempted = true;
       await this.launchWorker(run, runtime, token, false);
-      throwIfAborted(signal);
+      throwIfStartCancelled(startOperation, signal);
 
       if (signal) {
         abortListener = () => { void this.abortRun(runId); };
         signal.addEventListener("abort", abortListener, { once: true });
       }
+      throwIfStartCancelled(startOperation, signal);
       const ready = await waitForWorkerReady(channel, run.mode);
-      throwIfAborted(signal);
+      throwIfStartCancelled(startOperation, signal);
       this.update(run, {
         workerSessionId: ready.sessionId,
         workerSessionFile: ready.sessionFile,
       });
       verifyInitialReady(run, ready, input.model, input.thinking);
       this.update(run, { model: ready.model, thinking: parseThinkingLevel(ready.thinking) });
-      await channel.send("task", { task: `${DELEGATION_HEADER}\n\n${input.task}` });
-      throwIfAborted(signal);
+      const workspaceNote = run.workspace === "worktree" && run.worktree
+        ? `\n\nYou are isolated in Git worktree ${run.worktree.path} on branch ${run.worktree.branch}. Do not merge into the source checkout. Report Git status when you finish.`
+        : "";
+      throwIfStartCancelled(startOperation, signal);
+      await channel.send("task", { task: `${DELEGATION_HEADER}\n\n${input.task}${workspaceNote}` });
+      throwIfStartCancelled(startOperation, signal);
       this.update(run, { status: "running", startedAt: this.now() });
+      throwIfStartCancelled(startOperation, signal);
       return resultFromRun(run);
     } catch (error) {
-      const hasRuntime = this.runtimes.has(runId);
-      if (signal?.aborted) {
-        if (hasRuntime) await this.abortRun(runId);
-        else if (isActive(run.status)) {
-          this.update(run, {
-            status: "cancelled",
-            paneState: "closed",
-            completedAt: this.now(),
-            error: "Subagent start was cancelled",
-          });
+      if (error instanceof WorktreeOperationError) run.worktree = error.worktree;
+      let rollbackProblem: string | undefined;
+      if (!(error instanceof WorktreeOperationError)
+        && !launchAttempted
+        && run.workspace === "worktree"
+        && run.worktree?.state === "present") {
+        try {
+          const rollback = await this.dependencies.worktrees.rollback(run.worktree);
+          run.worktree = rollback.worktree;
+          if (rollback.warning) rollbackProblem = `worktree rollback warning: ${rollback.warning}`;
+        } catch (rollbackError) {
+          if (rollbackError instanceof WorktreeOperationError) run.worktree = rollbackError.worktree;
+          rollbackProblem = `worktree rollback was refused: ${errorMessage(rollbackError)}`;
         }
-        throw new Error("Subagent start was cancelled");
       }
-      await this.failStartup(run, error);
+      const startupError = rollbackProblem
+        ? new Error(`${errorMessage(error)}; ${rollbackProblem}`)
+        : error;
+      const cancelled = startOperation.cancellationRequested
+        || signal?.aborted === true
+        || error instanceof StartCancellationError;
+      if (cancelled) {
+        const cancellationMessage = rollbackProblem
+          ? `Subagent start was cancelled; ${rollbackProblem}`
+          : "Subagent start was cancelled";
+        await this.cancelStartup(run, cancellationMessage);
+        throw new StartCancellationError(cancellationMessage);
+      }
+      await this.failStartup(run, startupError);
       return resultFromRun(run);
     } finally {
       if (signal && abortListener) signal.removeEventListener("abort", abortListener);
+      if (this.startOperations.get(runId) === startOperation) this.startOperations.delete(runId);
+      startOperation.settled.resolve();
     }
   }
 
@@ -169,7 +225,12 @@ export class RunCoordinator {
       await this.dependencies.tmux.focus(run.tmuxTarget);
       return resultFromRun(run);
     }
-    if (input.action === "resume") return this.resume(run);
+    if (input.action === "resume") {
+      return this.runLifecycleOperation(run, "resume", (lifecycle) => this.resume(run, lifecycle));
+    }
+    if (input.action === "cleanup") {
+      return this.runLifecycleOperation(run, "cleanup", () => this.cleanup(run));
+    }
     if (input.action === "abort") {
       await this.abortRun(run.runId);
       return resultFromRun(run);
@@ -225,23 +286,109 @@ export class RunCoordinator {
     return [...this.runs.values()].map((run) => structuredClone(run));
   }
 
+  async validateCleanup(runId: string): Promise<RunRecord> {
+    if (this.shuttingDown) throw new Error("Cannot cleanup while the subagent coordinator is shutting down");
+    const run = this.requireRun(runId);
+    if (this.lifecycleOperations.has(runId)) {
+      throw new Error(`Another cleanup or resume operation is already in progress for ${runId}`);
+    }
+    if (this.runtimes.has(runId)) {
+      throw new Error("Cannot cleanup while the subagent runtime is still open or finalizing");
+    }
+    const lifecycle = lifecycleOperation("cleanup");
+    this.lifecycleOperations.set(runId, lifecycle);
+    try {
+      await this.dependencies.worktrees.validateCleanup(this.cleanupWorktree(run));
+      return structuredClone(run);
+    } finally {
+      this.lifecycleOperations.delete(runId);
+      lifecycle.settled.resolve();
+    }
+  }
+
   restore(runs: RunRecord[]): void {
     this.runs.clear();
     for (const run of runs) this.runs.set(run.runId, structuredClone(run));
   }
 
   async shutdown(): Promise<void> {
-    await Promise.all([...this.runtimes.keys()].map((runId) => this.abortRun(runId)));
+    this.shuttingDown = true;
+    const starts = [...this.startOperations.values()];
+    for (const start of starts) start.cancellationRequested = true;
+    const lifecycles = [...this.lifecycleOperations.values()];
+    for (const lifecycle of lifecycles) {
+      if (lifecycle.action === "resume") lifecycle.cancellationRequested = true;
+    }
+    await Promise.all([
+      ...[...this.runtimes.keys()].map((runId) => this.abortRuntime(runId)),
+      ...starts.map((start) => start.settled.promise),
+      ...lifecycles.map((lifecycle) => lifecycle.settled.promise),
+    ]);
   }
 
-  private async resume(run: RunRecord): Promise<RunResult> {
-    if (run.paneState === "open") throw new Error("Subagent pane is already open");
+  private async runLifecycleOperation(
+    run: RunRecord,
+    action: "cleanup" | "resume",
+    operation: (lifecycle: LifecycleOperation) => Promise<RunResult>,
+  ): Promise<RunResult> {
+    if (this.shuttingDown) {
+      throw new Error(`Cannot ${action} while the subagent coordinator is shutting down`);
+    }
+    if (this.lifecycleOperations.has(run.runId)) {
+      throw new Error(`Another cleanup or resume operation is already in progress for ${run.runId}`);
+    }
+    if (this.runtimes.has(run.runId)) {
+      throw new Error(`Cannot ${action} while the subagent runtime is still open or finalizing`);
+    }
+    const lifecycle = lifecycleOperation(action);
+    this.lifecycleOperations.set(run.runId, lifecycle);
+    try {
+      return await operation(lifecycle);
+    } finally {
+      this.lifecycleOperations.delete(run.runId);
+      lifecycle.settled.resolve();
+    }
+  }
+
+  private async cleanup(run: RunRecord): Promise<RunResult> {
+    try {
+      const worktree = await this.dependencies.worktrees.cleanup(this.cleanupWorktree(run));
+      this.update(run, { worktree });
+      return resultFromRun(run);
+    } catch (error) {
+      if (error instanceof WorktreeOperationError) {
+        this.update(run, { worktree: error.worktree, error: error.message });
+      }
+      throw error;
+    }
+  }
+
+  private cleanupWorktree(run: RunRecord): NonNullable<RunRecord["worktree"]> {
+    if (run.workspace !== "worktree") throw new Error("Shared workspace runs cannot be cleaned up");
+    if (!run.worktree) throw new Error("Worktree run has no prepared workspace to clean up");
+    if (isActive(run.status)) throw new Error("Worktree cleanup requires a settled run");
+    if (run.paneState !== "closed") throw new Error("Verify the subagent pane is closed before worktree cleanup");
+    return run.worktree;
+  }
+
+  private async resume(run: RunRecord, lifecycle: LifecycleOperation): Promise<RunResult> {
+    if (run.paneState !== "closed") throw new Error("Verify the subagent pane is closed before resume");
     if (!run.workerSessionFile || !run.workerSessionId) {
       throw new Error("Subagent has no persisted worker session to resume");
     }
-    await this.dependencies.tmux.validate();
     const token = this.newToken();
+    let launchedTarget: TmuxTarget | undefined;
     try {
+      throwIfResumeCancelled(lifecycle);
+      await this.dependencies.tmux.validate();
+      throwIfResumeCancelled(lifecycle);
+      if (run.workspace === "worktree") {
+        if (!run.worktree) throw new Error("Worktree run is missing workspace metadata");
+        throwIfResumeCancelled(lifecycle);
+        this.update(run, { worktree: await this.dependencies.worktrees.prepareResume(run.worktree) });
+        throwIfResumeCancelled(lifecycle);
+      }
+      throwIfResumeCancelled(lifecycle);
       const channel = await this.dependencies.ipc.open(
         run.runId,
         token,
@@ -255,20 +402,44 @@ export class RunCoordinator {
         aborting: false,
       };
       this.runtimes.set(run.runId, runtime);
-      await this.launchWorker(run, runtime, token, true);
+      throwIfResumeCancelled(lifecycle);
+      launchedTarget = await this.launchWorker(run, runtime, token, true);
+      throwIfResumeCancelled(lifecycle);
       const ready = await waitForWorkerReady(channel, run.mode);
+      throwIfResumeCancelled(lifecycle);
       if (run.mode === "sub") verifyInitialReady(run, ready, run.model, run.thinking);
       if (ready.sessionId !== run.workerSessionId) {
         throw new Error(`Subagent resumed session ${ready.sessionId}, expected ${run.workerSessionId}`);
       }
+      throwIfResumeCancelled(lifecycle);
       this.update(run, { model: ready.model, thinking: parseThinkingLevel(ready.thinking) });
+      throwIfResumeCancelled(lifecycle);
       return resultFromRun(run);
     } catch (error) {
+      const cancelled = lifecycle.cancellationRequested || error instanceof ResumeCancellationError;
       const runtime = this.runtimes.get(run.runId);
+      if (runtime) runtime.finishing = true;
       await runtime?.channel.close().catch(() => undefined);
+      const paneResult = launchedTarget
+        ? await this.closePaneAndVerify(launchedTarget.paneId)
+        : undefined;
+      const worktree = error instanceof WorktreeOperationError ? error.worktree : undefined;
+      const failure = cancelled
+        ? combineErrors(
+          "Subagent resume was cancelled",
+          error instanceof ResumeCancellationError ? undefined : errorMessage(error),
+        )
+        : errorMessage(error);
+      const persistedError = combineErrors(failure, paneResult?.error);
+      this.update(run, {
+        ...(worktree ? { worktree } : {}),
+        ...(paneResult ? { paneState: paneResult.paneState } : cancelled ? { paneState: "closed" } : {}),
+        ...(cancelled ? { status: "cancelled", completedAt: this.now() } : {}),
+        error: persistedError,
+      });
       this.runtimes.delete(run.runId);
-      if (run.tmuxTarget) await this.dependencies.tmux.close(run.tmuxTarget).catch(() => undefined);
-      this.update(run, { paneState: "closed", error: errorMessage(error) });
+      runtime?.settled.resolve();
+      if (cancelled) throw new ResumeCancellationError(persistedError);
       throw error;
     }
   }
@@ -278,7 +449,7 @@ export class RunCoordinator {
     runtime: Runtime,
     token: string,
     resume: boolean,
-  ): Promise<void> {
+  ): Promise<TmuxTarget> {
     const title = `${run.alias} · ${shortId(run.runId)}`;
     const commandOptions = {
       mode: run.mode,
@@ -295,7 +466,7 @@ export class RunCoordinator {
     const target = await this.dependencies.tmux.launch({
       placement: run.placement,
       ...(run.placement === "session" ? { sessionName: SUBAGENT_SESSION_NAME } : {}),
-      cwd: run.cwd,
+      cwd: run.workspace === "worktree" && run.worktree ? worktreeCwd(run.worktree) : run.cwd,
       title,
       command: buildPiCommand(commandOptions),
       environment: workerEnvironment(run.runId, token, runtime.channel.socketPath, resume, run.mode),
@@ -306,6 +477,7 @@ export class RunCoordinator {
       tmuxWindowId: target.windowId,
       tmuxSessionId: target.sessionId,
     });
+    return target;
   }
 
   private async handleWorkerEvent(runId: string, event: ProtocolEnvelope): Promise<void> {
@@ -366,7 +538,50 @@ export class RunCoordinator {
     }
   }
 
+  private async cancelStartup(run: RunRecord, cancellationMessage: string): Promise<void> {
+    const runtime = this.runtimes.get(run.runId);
+    if (runtime) {
+      if (runtime.finishing) {
+        await runtime.settled.promise;
+      } else {
+        await this.finish(
+          run,
+          isActive(run.status) ? "cancelled" : run.status,
+          run.report,
+          true,
+          isActive(run.status) ? cancellationMessage : undefined,
+        );
+      }
+    }
+    if (!runtime && run.tmuxTarget && run.paneState !== "closed") {
+      const paneResult = await this.closePaneAndVerify(run.tmuxTarget);
+      this.update(run, {
+        paneState: paneResult.paneState,
+        ...(isActive(run.status) ? { status: "cancelled", completedAt: this.now() } : {}),
+        error: combineErrors(run.error ?? cancellationMessage, paneResult.error),
+      });
+    } else if (isActive(run.status)) {
+      this.update(run, {
+        status: "cancelled",
+        paneState: "closed",
+        completedAt: this.now(),
+        error: cancellationMessage,
+      });
+    } else if (cancellationMessage !== "Subagent start was cancelled") {
+      this.update(run, { error: combineErrors(run.error, cancellationMessage) });
+    }
+  }
+
   private async abortRun(runId: string): Promise<void> {
+    const lifecycle = this.lifecycleOperations.get(runId);
+    if (lifecycle?.action === "resume") {
+      lifecycle.cancellationRequested = true;
+      await lifecycle.settled.promise;
+    }
+    await this.abortRuntime(runId);
+  }
+
+  private async abortRuntime(runId: string): Promise<void> {
     const run = this.runs.get(runId);
     const runtime = this.runtimes.get(runId);
     if (!run || !runtime || runtime.finishing) return;
@@ -389,16 +604,19 @@ export class RunCoordinator {
     const runtime = this.runtimes.get(run.runId);
     if (!runtime || runtime.finishing) return;
     runtime.finishing = true;
-    const changes: Partial<RunRecord> = {
+    await runtime.channel.close().catch(() => undefined);
+    const paneResult = closePane
+      ? run.tmuxTarget
+        ? await this.closePaneAndVerify(run.tmuxTarget)
+        : { paneState: "closed" as const }
+      : { paneState: "disconnected" as const };
+    this.update(run, {
       status,
+      paneState: paneResult.paneState,
       completedAt: this.now(),
       ...(report ? { report } : {}),
-      ...(error ? { error } : {}),
-    };
-    changes.paneState = closePane ? "closed" : "disconnected";
-    this.update(run, changes);
-    await runtime.channel.close().catch(() => undefined);
-    if (closePane && run.tmuxTarget) await this.dependencies.tmux.close(run.tmuxTarget).catch(() => undefined);
+      ...(error || paneResult.error ? { error: combineErrors(error, paneResult.error) } : {}),
+    });
     this.runtimes.delete(run.runId);
     runtime.settled.resolve();
   }
@@ -408,16 +626,45 @@ export class RunCoordinator {
     if (runtime) {
       runtime.finishing = true;
       await runtime.channel.close().catch(() => undefined);
-      runtime.settled.resolve();
-      this.runtimes.delete(run.runId);
     }
-    if (run.tmuxTarget) await this.dependencies.tmux.close(run.tmuxTarget).catch(() => undefined);
+    const paneResult = run.tmuxTarget
+      ? await this.closePaneAndVerify(run.tmuxTarget)
+      : { paneState: "closed" as const };
     this.update(run, {
       status: "failed",
-      paneState: "closed",
+      paneState: paneResult.paneState,
       completedAt: this.now(),
-      error: errorMessage(error),
+      error: combineErrors(errorMessage(error), paneResult.error),
     });
+    this.runtimes.delete(run.runId);
+    runtime?.settled.resolve();
+  }
+
+  private async closePaneAndVerify(target: string): Promise<{
+    paneState: "closed" | "open" | "disconnected";
+    error?: string;
+  }> {
+    let closeError: string | undefined;
+    try {
+      await this.dependencies.tmux.close(target);
+    } catch (error) {
+      closeError = `Could not close subagent pane ${target}: ${errorMessage(error)}`;
+    }
+    try {
+      if (!await this.dependencies.tmux.exists(target)) return { paneState: "closed" };
+      return {
+        paneState: "open",
+        error: combineErrors(closeError, `Subagent pane ${target} still exists after close`),
+      };
+    } catch (error) {
+      return {
+        paneState: "disconnected",
+        error: combineErrors(
+          closeError,
+          `Could not verify whether subagent pane ${target} closed: ${errorMessage(error)}`,
+        ),
+      };
+    }
   }
 
   private requireRun(runId: string): RunRecord {
@@ -579,8 +826,39 @@ function resolvedDeferred(): Deferred {
   return value;
 }
 
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw new Error("Subagent start was cancelled");
+function createStartOperation(): StartOperation {
+  return { cancellationRequested: false, settled: deferred() };
+}
+
+function lifecycleOperation(action: LifecycleOperation["action"]): LifecycleOperation {
+  return { action, cancellationRequested: false, settled: deferred() };
+}
+
+class StartCancellationError extends Error {
+  constructor(message = "Subagent start was cancelled") {
+    super(message);
+    this.name = "StartCancellationError";
+  }
+}
+
+class ResumeCancellationError extends Error {
+  constructor(message = "Subagent resume was cancelled") {
+    super(message);
+    this.name = "ResumeCancellationError";
+  }
+}
+
+function throwIfResumeCancelled(lifecycle: LifecycleOperation): void {
+  if (lifecycle.cancellationRequested) throw new ResumeCancellationError();
+}
+
+function throwIfStartCancelled(operation: StartOperation, signal: AbortSignal | undefined): void {
+  if (operation.cancellationRequested || signal?.aborted) throw new StartCancellationError();
+}
+
+function combineErrors(first: string | undefined, second: string | undefined): string {
+  if (!first) return second ?? "Unknown subagent error";
+  return second ? `${first}; ${second}` : first;
 }
 
 function errorMessage(error: unknown): string {

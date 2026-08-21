@@ -4,7 +4,8 @@ import { RunCoordinator, type CoordinatorDependencies } from "./coordinator.js";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
 import type { ProtocolEnvelope } from "./protocol.js";
 import type { TmuxAdapter, TmuxLaunch, TmuxTarget } from "./tmux.js";
-import type { RunRecord } from "./types.js";
+import type { RunRecord, WorktreeRecord } from "./types.js";
+import { WorktreeOperationError, type WorktreeAdapter, type WorktreeRollbackResult } from "./worktree.js";
 
 class FakeChannel implements WorkerChannel {
   readonly socketPath = "/tmp/worker.sock";
@@ -12,10 +13,12 @@ class FakeChannel implements WorkerChannel {
   readonly readinessTimeouts: Array<number | undefined> = [];
   closed = false;
   sendGate?: Promise<void>;
+  readyGate?: Promise<void>;
 
   constructor(readonly ready: WorkerReady) {}
   async waitForReady(timeoutMs?: number): Promise<WorkerReady> {
     this.readinessTimeouts.push(timeoutMs);
+    await this.readyGate;
     return this.ready;
   }
   async send(type: string, payload?: Record<string, unknown>): Promise<void> {
@@ -27,32 +30,131 @@ class FakeChannel implements WorkerChannel {
 
 class FakeIpc implements IpcAdapter {
   onEvent?: (event: ProtocolEnvelope) => void | Promise<void>;
+  failOpen = false;
+  openCalls = 0;
+  openGate?: Promise<void>;
   constructor(readonly channel: FakeChannel) {}
   async open(_runId: string, _token: string, onEvent: (event: ProtocolEnvelope) => void | Promise<void>): Promise<WorkerChannel> {
+    this.openCalls += 1;
+    await this.openGate;
+    if (this.failOpen) throw new Error("IPC unavailable");
     this.onEvent = onEvent;
     return this.channel;
   }
   async emit(event: ProtocolEnvelope): Promise<void> { await this.onEvent?.(event); }
 }
 
+class FakeWorktrees implements WorktreeAdapter {
+  prepared: Array<{ sourceCwd: string; runId: string }> = [];
+  rolledBack: WorktreeRecord[] = [];
+  validatedForCleanup: WorktreeRecord[] = [];
+  cleaned: WorktreeRecord[] = [];
+  resumed: WorktreeRecord[] = [];
+  prepareError?: Error;
+  prepareGate?: Promise<void>;
+  rollbackError?: Error;
+  rollbackWarning?: string;
+  cleanupValidationError?: Error;
+  cleanupValidationGate?: Promise<void>;
+  cleanupError?: Error;
+  cleanupGate?: Promise<void>;
+  resumeGate?: Promise<void>;
+  resumeError?: Error;
+  record: WorktreeRecord = {
+    path: "/agent/heishi/worktrees/repo-abc/12345678-1234-1234-1234-123456789abc",
+    branch: "heishi/12345678-1234-1234-1234-123456789abc",
+    baseCommit: "base-commit",
+    state: "present",
+    gitCommonDir: "/repo/.git",
+    repositoryName: "repo",
+    relativeCwd: ".",
+  };
+  async prepare(sourceCwd: string, runId: string): Promise<WorktreeRecord> {
+    this.prepared.push({ sourceCwd, runId });
+    if (this.prepareError) throw this.prepareError;
+    await this.prepareGate;
+    return structuredClone(this.record);
+  }
+  async rollback(worktree: WorktreeRecord): Promise<WorktreeRollbackResult> {
+    this.rolledBack.push(structuredClone(worktree));
+    if (this.rollbackError) throw this.rollbackError;
+    const result: WorktreeRollbackResult = {
+      worktree: removedWorktree(worktree, "rollback-commit"),
+    };
+    if (this.rollbackWarning) result.warning = this.rollbackWarning;
+    return result;
+  }
+  async validateCleanup(worktree: WorktreeRecord): Promise<void> {
+    this.validatedForCleanup.push(structuredClone(worktree));
+    await this.cleanupValidationGate;
+    if (this.cleanupValidationError) throw this.cleanupValidationError;
+  }
+  async cleanup(worktree: WorktreeRecord): Promise<WorktreeRecord> {
+    await this.validateCleanup(worktree);
+    this.cleaned.push(structuredClone(worktree));
+    await this.cleanupGate;
+    if (this.cleanupError) throw this.cleanupError;
+    return removedWorktree(worktree, "cleanup-commit");
+  }
+  async prepareResume(worktree: WorktreeRecord): Promise<WorktreeRecord> {
+    this.resumed.push(structuredClone(worktree));
+    await this.resumeGate;
+    if (this.resumeError) throw this.resumeError;
+    return presentWorktree(worktree);
+  }
+}
+
 class FakeTmux implements TmuxAdapter {
   validated = false;
   launches: TmuxLaunch[] = [];
   closed: string[] = [];
-  async validate(): Promise<void> { this.validated = true; }
-  async launch(spec: TmuxLaunch): Promise<TmuxTarget> {
-    this.launches.push(spec);
-    return { paneId: `%${8 + this.launches.length}`, windowId: "@2", sessionId: "$1" };
+  existingTargets = new Set<string>();
+  closeGate?: Promise<void>;
+  closeLeavesTarget = false;
+  launchError?: Error;
+  nextTarget?: TmuxTarget;
+  existsError?: Error;
+  validateGate?: Promise<void>;
+  launchGate?: Promise<void>;
+  async validate(): Promise<void> {
+    this.validated = true;
+    await this.validateGate;
   }
-  async exists(): Promise<boolean> { return true; }
+  async launch(spec: TmuxLaunch): Promise<TmuxTarget> {
+    await this.launchGate;
+    this.launches.push(spec);
+    if (this.launchError) throw this.launchError;
+    const target = this.nextTarget ?? { paneId: `%${8 + this.launches.length}`, windowId: "@2", sessionId: "$1" };
+    this.existingTargets.add(target.paneId);
+    return target;
+  }
+  async exists(target: string): Promise<boolean> {
+    if (this.existsError) throw this.existsError;
+    return this.existingTargets.has(target);
+  }
   async focus(): Promise<void> {}
-  async close(target: string): Promise<void> { this.closed.push(target); }
+  async close(target: string): Promise<void> {
+    this.closed.push(target);
+    await this.closeGate;
+    if (!this.closeLeavesTarget) this.existingTargets.delete(target);
+  }
+}
+
+function removedWorktree(worktree: WorktreeRecord, resumeCommit: string): WorktreeRecord {
+  const { resumeCommit: _oldResumeCommit, ...record } = worktree;
+  return { ...record, state: "removed", resumeCommit };
+}
+
+function presentWorktree(worktree: WorktreeRecord): WorktreeRecord {
+  const { resumeCommit: _resumeCommit, ...record } = worktree;
+  return { ...record, state: "present" };
 }
 
 function fixture(ready: Partial<WorkerReady> = {}): {
   coordinator: RunCoordinator;
   ipc: FakeIpc;
   tmux: FakeTmux;
+  worktrees: FakeWorktrees;
   records: RunRecord[];
 } {
   const channel = new FakeChannel({
@@ -64,6 +166,7 @@ function fixture(ready: Partial<WorkerReady> = {}): {
   });
   const ipc = new FakeIpc(channel);
   const tmux = new FakeTmux();
+  const worktrees = new FakeWorktrees();
   const records: RunRecord[] = [];
   let runNumber = 0;
   const dependencies: CoordinatorDependencies = {
@@ -72,6 +175,7 @@ function fixture(ready: Partial<WorkerReady> = {}): {
     piPath: "/bin/pi",
     tmux,
     ipc,
+    worktrees,
     persist: (record) => { records.push(structuredClone(record)); },
     projectTrusted: true,
     newRunId: () => runNumber++ === 0
@@ -84,13 +188,18 @@ function fixture(ready: Partial<WorkerReady> = {}): {
       return () => new Date(1_700_000_000_000 + tick++ * 1000).toISOString();
     })(),
   };
-  return { coordinator: new RunCoordinator(dependencies), ipc, tmux, records };
+  return { coordinator: new RunCoordinator(dependencies), ipc, tmux, worktrees, records };
+}
+
+async function pause(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 1));
 }
 
 function completedRun(): RunRecord {
   return {
-    version: 2,
+    version: 3,
     mode: "sub",
+    workspace: "shared",
     runId: "run-1",
     alias: "Circe",
     taskPreview: "Inspect",
@@ -157,8 +266,123 @@ Inspect the repository`,
     assert.deepEqual(tmux.closed, ["%9"]);
   });
 
-  it("starts main mode with Pi defaults and persists effective readiness metadata", async () => {
-    const { coordinator, ipc, tmux } = fixture({ model: "provider/default", thinking: "medium" });
+  it("rejects worktree workspace in sub mode before Git or tmux work", async () => {
+    const { coordinator, tmux, worktrees } = fixture();
+
+    await assert.rejects(
+      () => coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high", workspace: "worktree" }),
+      /only in main mode/u,
+    );
+
+    assert.equal(tmux.validated, false);
+    assert.deepEqual(worktrees.prepared, []);
+  });
+
+  it("does not launch tmux when worktree preparation rejects the source checkout", async () => {
+    const { coordinator, tmux, worktrees } = fixture();
+    worktrees.prepareError = new Error("Git worktree workspace requires a clean source checkout");
+
+    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.workspace, "worktree");
+    assert.equal(failed.worktree, undefined);
+    assert.match(failed.error ?? "", /clean source checkout/u);
+    assert.deepEqual(tmux.launches, []);
+  });
+
+  it("persists removed metadata from a worktree preparation failure", async () => {
+    const { coordinator, tmux, worktrees, records } = fixture();
+    const removed = removedWorktree(worktrees.record, "retained-branch-tip");
+    worktrees.prepareError = new WorktreeOperationError(
+      "Created worktree verification failed; branch and internal lease were retained for manual recovery",
+      removed,
+    );
+
+    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.worktree?.state, "removed");
+    assert.match(failed.error ?? "", /internal lease were retained for manual recovery/u);
+    const persistedWorktree = records.at(-1)?.worktree;
+    assert.equal(persistedWorktree?.state, "removed");
+    assert.equal(persistedWorktree?.state === "removed" ? persistedWorktree.resumeCommit : undefined, "retained-branch-tip");
+    assert.deepEqual(worktrees.rolledBack, []);
+    assert.deepEqual(tmux.launches, []);
+  });
+
+  it("starts a main worker in its prepared worktree and reports workspace metadata", async () => {
+    const { coordinator, ipc, tmux, worktrees } = fixture();
+
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement the change" });
+
+    assert.equal(started.workspace, "worktree");
+    assert.deepEqual(started.worktree, {
+      path: worktrees.record.path,
+      branch: worktrees.record.branch,
+      baseCommit: worktrees.record.baseCommit,
+      state: "present",
+    });
+    assert.equal(tmux.launches[0]?.cwd, worktrees.record.path);
+    assert.match(String(ipc.channel.sent[0]?.payload?.["task"]), /isolated in Git worktree/u);
+    assert.match(String(ipc.channel.sent[0]?.payload?.["task"]), /Do not merge into the source checkout/u);
+    assert.match(String(ipc.channel.sent[0]?.payload?.["task"]), /Report Git status/u);
+    await coordinator.shutdown();
+  });
+
+  it("persists removed rollback state and surfaces retained-ref warnings", async () => {
+    const { coordinator, ipc, worktrees, records } = fixture();
+    ipc.failOpen = true;
+    worktrees.rollbackWarning = "Worktree branch and internal lease were retained for manual recovery";
+
+    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.worktree?.state, "removed");
+    assert.match(failed.error ?? "", /worktree rollback warning.*internal lease were retained/u);
+    assert.equal(records.at(-1)?.worktree?.state, "removed");
+    assert.equal(records.at(-1)?.status, "failed");
+  });
+
+  it("keeps present rollback state when removal is refused before it completes", async () => {
+    const { coordinator, ipc, worktrees, records } = fixture();
+    ipc.failOpen = true;
+    worktrees.rollbackError = new Error("could not remove registered worktree");
+
+    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+
+    assert.equal(failed.worktree?.state, "present");
+    assert.match(failed.error ?? "", /rollback was refused.*could not remove/u);
+    assert.equal(records.at(-1)?.worktree?.state, "present");
+  });
+
+  it("rolls back a prepared worktree only when startup fails before launch", async () => {
+    const beforeLaunch = fixture();
+    beforeLaunch.ipc.failOpen = true;
+    const failed = await beforeLaunch.coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.worktree?.state, "removed");
+    assert.equal(beforeLaunch.worktrees.rolledBack.length, 1);
+    assert.deepEqual(beforeLaunch.tmux.launches, []);
+    assert.equal(beforeLaunch.records.some((record) => {
+      return record.worktree?.state === "removed"
+        && (record.status === "created" || record.status === "starting" || record.status === "running");
+    }), false);
+
+    const afterLaunch = fixture({ model: "provider/unexpected" });
+    const launched = await afterLaunch.coordinator.start({
+      mode: "main",
+      workspace: "worktree",
+      task: "Implement",
+      model: "provider/requested",
+    });
+    assert.equal(launched.status, "failed");
+    assert.equal(launched.worktree?.state, "present");
+    assert.deepEqual(afterLaunch.worktrees.rolledBack, []);
+  });
+
+  it("starts main mode with Pi defaults in the shared workspace", async () => {
+    const { coordinator, ipc, tmux, worktrees } = fixture({ model: "provider/default", thinking: "medium" });
 
     const started = await coordinator.start({ mode: "main", task: "Inspect the repository" });
 
@@ -172,6 +396,8 @@ Inspect the repository`,
     assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "main");
     assert.equal(tmux.launches[0]?.placement, "window");
     assert.equal(tmux.launches[0]?.sessionName, undefined);
+    assert.deepEqual(worktrees.prepared, []);
+    assert.equal(started.workspace, undefined);
     await coordinator.shutdown();
   });
 
@@ -267,6 +493,46 @@ Inspect the repository`,
     );
   });
 
+  it("preserves rollback warnings and refusals when startup is cancelled before launch", async () => {
+    const warningFixture = fixture();
+    const warningController = new AbortController();
+    let releaseWarningPrepare!: () => void;
+    warningFixture.worktrees.prepareGate = new Promise<void>((resolve) => { releaseWarningPrepare = resolve; });
+    warningFixture.worktrees.rollbackWarning = "branch ownership changed and the branch was retained";
+    const warningStart = warningFixture.coordinator.start(
+      { mode: "main", workspace: "worktree", task: "Implement" },
+      warningController.signal,
+    );
+    while (warningFixture.worktrees.prepared.length === 0) await pause();
+    warningController.abort();
+    releaseWarningPrepare();
+
+    await assert.rejects(warningStart, /cancelled.*rollback warning.*ownership changed/u);
+    const warnedRun = warningFixture.coordinator.list()[0];
+    assert.equal(warnedRun?.status, "cancelled");
+    assert.equal(warnedRun?.worktree?.state, "removed");
+    assert.match(warnedRun?.error ?? "", /cancelled.*rollback warning/u);
+
+    const refusalFixture = fixture();
+    const refusalController = new AbortController();
+    let releaseRefusalPrepare!: () => void;
+    refusalFixture.worktrees.prepareGate = new Promise<void>((resolve) => { releaseRefusalPrepare = resolve; });
+    refusalFixture.worktrees.rollbackError = new Error("registered worktree could not be removed");
+    const refusalStart = refusalFixture.coordinator.start(
+      { mode: "main", workspace: "worktree", task: "Implement" },
+      refusalController.signal,
+    );
+    while (refusalFixture.worktrees.prepared.length === 0) await pause();
+    refusalController.abort();
+    releaseRefusalPrepare();
+
+    await assert.rejects(refusalStart, /cancelled.*rollback was refused.*could not be removed/u);
+    const refusedRun = refusalFixture.coordinator.list()[0];
+    assert.equal(refusedRun?.status, "cancelled");
+    assert.equal(refusedRun?.worktree?.state, "present");
+    assert.match(refusedRun?.error ?? "", /cancelled.*rollback was refused/u);
+  });
+
   it("cancels startup without overwriting the terminal status", async () => {
     const { coordinator, ipc, tmux } = fixture();
     const controller = new AbortController();
@@ -285,6 +551,107 @@ Inspect the repository`,
     await assert.rejects(starting, /cancelled/);
     assert.equal(coordinator.list()[0]?.status, "cancelled");
     assert.deepEqual(tmux.closed, ["%9"]);
+  });
+
+  it("waits for startup cancellation during tmux validation", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    let releaseValidation!: () => void;
+    tmux.validateGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+    const starting = coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+    const startRejected = assert.rejects(starting, /Subagent start was cancelled/u);
+    while (!tmux.validated) await pause();
+
+    let shutdownSettled = false;
+    const shuttingDown = coordinator.shutdown().then(() => { shutdownSettled = true; });
+    await pause();
+    assert.equal(shutdownSettled, false);
+
+    releaseValidation();
+    await startRejected;
+    await shuttingDown;
+
+    assert.equal(coordinator.list()[0]?.status, "cancelled");
+    assert.equal(ipc.openCalls, 0);
+    assert.deepEqual(tmux.launches, []);
+    assert.equal(tmux.existingTargets.size, 0);
+    await assert.rejects(
+      () => coordinator.start({ task: "Inspect again", model: "openai/model", thinking: "high" }),
+      /coordinator is shutting down/u,
+    );
+  });
+
+  it("waits for startup cancellation and worktree rollback during preparation", async () => {
+    const { coordinator, ipc, tmux, worktrees } = fixture();
+    let releasePrepare!: () => void;
+    worktrees.prepareGate = new Promise<void>((resolve) => { releasePrepare = resolve; });
+    const starting = coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const startRejected = assert.rejects(starting, /Subagent start was cancelled/u);
+    while (worktrees.prepared.length === 0) await pause();
+
+    let shutdownSettled = false;
+    const shuttingDown = coordinator.shutdown().then(() => { shutdownSettled = true; });
+    await pause();
+    assert.equal(shutdownSettled, false);
+
+    releasePrepare();
+    await startRejected;
+    await shuttingDown;
+
+    assert.equal(coordinator.list()[0]?.status, "cancelled");
+    assert.equal(coordinator.list()[0]?.worktree?.state, "removed");
+    assert.equal(worktrees.rolledBack.length, 1);
+    assert.equal(ipc.openCalls, 0);
+    assert.deepEqual(tmux.launches, []);
+    assert.equal(tmux.existingTargets.size, 0);
+  });
+
+  it("waits for startup cancellation while IPC is opening before runtime registration", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    let releaseOpen!: () => void;
+    ipc.openGate = new Promise<void>((resolve) => { releaseOpen = resolve; });
+    const starting = coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+    const startRejected = assert.rejects(starting, /Subagent start was cancelled/u);
+    while (ipc.openCalls === 0) await pause();
+
+    let shutdownSettled = false;
+    const shuttingDown = coordinator.shutdown().then(() => { shutdownSettled = true; });
+    await pause();
+    assert.equal(shutdownSettled, false);
+
+    releaseOpen();
+    await startRejected;
+    await shuttingDown;
+
+    assert.equal(coordinator.list()[0]?.status, "cancelled");
+    assert.equal(ipc.channel.closed, true);
+    assert.deepEqual(tmux.launches, []);
+    assert.equal(tmux.existingTargets.size, 0);
+  });
+
+  it("waits for startup cancellation after launch and closes the worker pane", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    let releaseReady!: () => void;
+    ipc.channel.readyGate = new Promise<void>((resolve) => { releaseReady = resolve; });
+    const starting = coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+    const startRejected = assert.rejects(starting, /Subagent start was cancelled/u);
+    while (tmux.launches.length === 0) await pause();
+
+    let shutdownSettled = false;
+    const shuttingDown = coordinator.shutdown().then(() => { shutdownSettled = true; });
+    await pause();
+    assert.equal(shutdownSettled, false);
+
+    releaseReady();
+    await startRejected;
+    await shuttingDown;
+
+    const cancelled = coordinator.list()[0];
+    assert.equal(cancelled?.status, "cancelled");
+    assert.equal(cancelled?.paneState, "closed");
+    assert.equal(cancelled?.tmuxTarget, "%9");
+    assert.equal(ipc.channel.closed, true);
+    assert.deepEqual(tmux.closed, ["%9"]);
+    assert.equal(tmux.existingTargets.size, 0);
   });
 
   it("returns a failed run when Pi changes the requested model or thinking level", async () => {
@@ -409,6 +776,362 @@ Inspect the repository`,
     await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Direct work done" });
     assert.equal((await waiting).report?.summary, "Direct work done");
     await coordinator.shutdown();
+  });
+
+  it("validates cleanup before prompting and repeats worktree checks during cleanup", async () => {
+    const { coordinator, ipc, worktrees } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+
+    await assert.rejects(
+      () => coordinator.validateCleanup(started.runId),
+      /runtime is still open or finalizing/u,
+    );
+    assert.deepEqual(worktrees.validatedForCleanup, []);
+
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    const validated = await coordinator.validateCleanup(started.runId);
+    assert.equal(validated.runId, started.runId);
+    assert.deepEqual(worktrees.validatedForCleanup.length, 1);
+
+    await coordinator.control({ runId: started.runId, action: "cleanup" });
+    assert.deepEqual(worktrees.validatedForCleanup.length, 2);
+  });
+
+  it("excludes cleanup and resume while cleanup validation is in progress", async () => {
+    const { coordinator, ipc, worktrees } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    let releaseValidation!: () => void;
+    worktrees.cleanupValidationGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+
+    const validating = coordinator.validateCleanup(started.runId);
+    while (worktrees.validatedForCleanup.length === 0) await pause();
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /already in progress/u,
+    );
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "resume" }),
+      /already in progress/u,
+    );
+
+    releaseValidation();
+    await validating;
+  });
+
+  it("rejects dirty cleanup during non-mutating validation", async () => {
+    const { coordinator, ipc, worktrees } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    worktrees.cleanupValidationError = new Error("Worktree has modified, untracked, or ignored files; cleanup refused");
+
+    await assert.rejects(() => coordinator.validateCleanup(started.runId), /cleanup refused/u);
+    assert.deepEqual(worktrees.cleaned, []);
+  });
+
+  it("persists removed metadata and error when cleanup detects inconsistent retained refs", async () => {
+    const { coordinator, ipc, worktrees, records } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    const removed = removedWorktree(worktrees.record, "cleanup-commit");
+    worktrees.cleanupError = new WorktreeOperationError(
+      "Git worktree was removed, but retained refs are inconsistent: retained branch moved",
+      removed,
+    );
+
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /retained refs are inconsistent/u,
+    );
+
+    const persisted = records.at(-1);
+    assert.equal(persisted?.worktree?.state, "removed");
+    assert.equal(persisted?.worktree?.state === "removed" ? persisted.worktree.resumeCommit : undefined, "cleanup-commit");
+    assert.match(persisted?.error ?? "", /retained branch moved/u);
+  });
+
+  it("rejects cleanup and resume while auto-close finalization is still tearing down runtime resources", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    let releaseClose!: () => void;
+    tmux.closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+
+    const finalizing = ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    while (tmux.closed.length === 0) await pause();
+    assert.equal(coordinator.list()[0]?.status, "running");
+    assert.equal(coordinator.list()[0]?.paneState, "open");
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /runtime is still open or finalizing/u,
+    );
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "resume" }),
+      /runtime is still open or finalizing/u,
+    );
+
+    releaseClose();
+    await finalizing;
+    assert.equal((await coordinator.control({ runId: started.runId, action: "cleanup" })).worktree?.state, "removed");
+  });
+
+  it("keeps cleanup blocked when pane close verification finds the pane still present", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    tmux.closeLeavesTarget = true;
+
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+
+    const run = coordinator.list()[0];
+    assert.equal(run?.status, "completed");
+    assert.equal(run?.paneState, "open");
+    assert.match(run?.error ?? "", /still exists after close/u);
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /pane is closed/u,
+    );
+  });
+
+  it("keeps cleanup blocked when pane close verification fails", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    tmux.existsError = new Error("tmux server unavailable");
+
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+
+    const run = coordinator.list()[0];
+    assert.equal(run?.paneState, "disconnected");
+    assert.match(run?.error ?? "", /Could not verify.*server unavailable/u);
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /pane is closed/u,
+    );
+  });
+
+  it("does not claim startup cleanup closed a pane that still exists", async () => {
+    const { coordinator, tmux } = fixture({ model: "provider/unexpected" });
+    tmux.closeLeavesTarget = true;
+
+    const failed = await coordinator.start({
+      mode: "main",
+      workspace: "worktree",
+      task: "Implement",
+      model: "provider/requested",
+    });
+
+    assert.equal(failed.status, "failed");
+    assert.equal(coordinator.list()[0]?.paneState, "open");
+    assert.match(failed.error ?? "", /still exists after close/u);
+    await assert.rejects(
+      () => coordinator.control({ runId: failed.runId, action: "cleanup" }),
+      /pane is closed/u,
+    );
+  });
+
+  it("persists ambiguous worktree state when resume rollback fails", async () => {
+    const { coordinator, ipc, worktrees, records } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    await coordinator.control({ runId: started.runId, action: "cleanup" });
+    const removed = coordinator.list()[0]?.worktree;
+    assert.ok(removed);
+    worktrees.resumeError = new WorktreeOperationError(
+      "resume add failed; rollback failed",
+      presentWorktree(removed),
+    );
+
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "resume" }),
+      /rollback failed/u,
+    );
+
+    const persisted = records.at(-1);
+    assert.equal(persisted?.worktree?.state, "present");
+    assert.match(persisted?.error ?? "", /rollback failed/u);
+    assert.deepEqual(worktrees.cleaned.length, 1);
+  });
+
+  it("cancels and waits for resume before runtime creation", async () => {
+    const { coordinator, ipc, tmux, records } = fixture();
+    coordinator.restore([completedRun()]);
+    let releaseValidation!: () => void;
+    tmux.validateGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+
+    const resuming = coordinator.control({ runId: "run-1", action: "resume" });
+    const resumeRejected = assert.rejects(resuming, /Subagent resume was cancelled/u);
+    while (!tmux.validated) await pause();
+    let abortSettled = false;
+    const aborting = coordinator.control({ runId: "run-1", action: "abort" })
+      .then((result) => { abortSettled = true; return result; });
+    await pause();
+    assert.equal(abortSettled, false);
+
+    releaseValidation();
+    await resumeRejected;
+    const aborted = await aborting;
+
+    assert.equal(aborted.status, "cancelled");
+    assert.equal(ipc.openCalls, 0);
+    assert.deepEqual(tmux.launches, []);
+    assert.deepEqual(tmux.closed, []);
+    assert.equal(records.at(-1)?.status, "cancelled");
+    assert.ok(records.at(-1)?.completedAt);
+    assert.match(records.at(-1)?.error ?? "", /Subagent resume was cancelled/u);
+  });
+
+  it("cancels and closes a resume after its runtime launches", async () => {
+    const { coordinator, ipc, tmux, records } = fixture();
+    coordinator.restore([completedRun()]);
+    let releaseReady!: () => void;
+    ipc.channel.readyGate = new Promise<void>((resolve) => { releaseReady = resolve; });
+
+    const resuming = coordinator.control({ runId: "run-1", action: "resume" });
+    const resumeRejected = assert.rejects(resuming, /Subagent resume was cancelled/u);
+    while (tmux.launches.length === 0) await pause();
+    let abortSettled = false;
+    const aborting = coordinator.control({ runId: "run-1", action: "abort" })
+      .then((result) => { abortSettled = true; return result; });
+    await pause();
+    assert.equal(abortSettled, false);
+
+    releaseReady();
+    await resumeRejected;
+    const aborted = await aborting;
+
+    assert.equal(aborted.status, "cancelled");
+    assert.equal(ipc.channel.closed, true);
+    assert.deepEqual(tmux.closed, ["%9"]);
+    assert.equal(tmux.existingTargets.size, 0);
+    assert.equal(records.at(-1)?.status, "cancelled");
+    await assert.rejects(
+      () => coordinator.control({ runId: "run-1", action: "prompt", message: "More" }),
+      /not connected/u,
+    );
+  });
+
+  it("cancels and waits for an in-progress resume during shutdown", async () => {
+    const { coordinator, ipc, tmux, records } = fixture();
+    coordinator.restore([completedRun()]);
+    let releaseOpen!: () => void;
+    ipc.openGate = new Promise<void>((resolve) => { releaseOpen = resolve; });
+
+    const resuming = coordinator.control({ runId: "run-1", action: "resume" });
+    const resumeRejected = assert.rejects(resuming, /Subagent resume was cancelled/u);
+    while (ipc.openCalls === 0) await pause();
+    let shutdownSettled = false;
+    const shuttingDown = coordinator.shutdown().then(() => { shutdownSettled = true; });
+    await pause();
+    assert.equal(shutdownSettled, false);
+
+    releaseOpen();
+    await resumeRejected;
+    await shuttingDown;
+
+    assert.equal(records.at(-1)?.status, "cancelled");
+    assert.equal(ipc.channel.closed, true);
+    assert.deepEqual(tmux.launches, []);
+    assert.deepEqual(tmux.closed, []);
+    await assert.rejects(
+      () => coordinator.control({ runId: "run-1", action: "resume" }),
+      /coordinator is shutting down/u,
+    );
+  });
+
+  it("does not close a stale pane target when resume fails before launch", async () => {
+    const { coordinator, ipc, tmux } = fixture();
+    coordinator.restore([{
+      ...completedRun(),
+      tmuxTarget: "%stale",
+      tmuxWindowId: "@old",
+      tmuxSessionId: "$old",
+    }]);
+    ipc.failOpen = true;
+
+    await assert.rejects(() => coordinator.control({ runId: "run-1", action: "resume" }), /IPC unavailable/u);
+
+    assert.deepEqual(tmux.closed, []);
+    assert.equal(coordinator.list()[0]?.paneState, "closed");
+  });
+
+  it("closes only the pane returned by the current resume launch", async () => {
+    for (const target of ["%new", "%stale"] as const) {
+      const { coordinator, tmux } = fixture({ sessionId: "wrong-session" });
+      coordinator.restore([{
+        ...completedRun(),
+        tmuxTarget: "%stale",
+        tmuxWindowId: "@old",
+        tmuxSessionId: "$old",
+      }]);
+      tmux.nextTarget = { paneId: target, windowId: "@new", sessionId: "$new" };
+
+      await assert.rejects(
+        () => coordinator.control({ runId: "run-1", action: "resume" }),
+        /expected session-1/u,
+      );
+
+      assert.deepEqual(tmux.closed, [target]);
+      assert.equal(coordinator.list()[0]?.paneState, "closed");
+    }
+  });
+
+  it("rejects resume while cleanup is concurrently in progress", async () => {
+    const { coordinator, ipc, worktrees } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    let releaseCleanup!: () => void;
+    worktrees.cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+
+    const cleaning = coordinator.control({ runId: started.runId, action: "cleanup" });
+    while (worktrees.cleaned.length === 0) await pause();
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "resume" }),
+      /cleanup or resume operation is already in progress/u,
+    );
+
+    releaseCleanup();
+    assert.equal((await cleaning).worktree?.state, "removed");
+  });
+
+  it("cleans only settled closed worktree runs and recreates them on resume", async () => {
+    const { coordinator, ipc, worktrees } = fixture();
+    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /runtime is still open or finalizing/u,
+    );
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+
+    const cleaned = await coordinator.control({ runId: started.runId, action: "cleanup" });
+    assert.equal(cleaned.worktree?.state, "removed");
+    assert.equal(worktrees.cleaned.length, 1);
+
+    const resumed = await coordinator.control({ runId: started.runId, action: "resume" });
+    assert.equal(resumed.worktree?.state, "present");
+    assert.equal(worktrees.resumed[0]?.state, "removed");
+    await assert.rejects(
+      () => coordinator.control({ runId: started.runId, action: "cleanup" }),
+      /runtime is still open or finalizing/ui,
+    );
+    await coordinator.shutdown();
+  });
+
+  it("rejects cleanup for shared runs", async () => {
+    const { coordinator } = fixture();
+    coordinator.restore([completedMainRun()]);
+    await assert.rejects(
+      () => coordinator.control({ runId: "run-1", action: "cleanup" }),
+      /Shared workspace runs/u,
+    );
+  });
+
+  it("rejects resume until a disconnected pane is verified closed", async () => {
+    const { coordinator, tmux } = fixture();
+    coordinator.restore([{ ...completedMainRun(), paneState: "disconnected", tmuxTarget: "%8" }]);
+
+    await assert.rejects(
+      () => coordinator.control({ runId: "run-1", action: "resume" }),
+      /Verify the subagent pane is closed before resume/u,
+    );
+    assert.deepEqual(tmux.launches, []);
   });
 
   it("resumes main sessions without forcing their last effective model or thinking", async () => {

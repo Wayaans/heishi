@@ -29,12 +29,16 @@ import {
   reconcileRuns,
   restoreRunSnapshots,
   restoreSessionMode,
+  restoreSessionWorkspace,
   RUN_ENTRY_TYPE,
+  WORKSPACE_ENTRY_TYPE,
 } from "./registry.js";
 import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
 import { THINKING_LEVELS, Tmux } from "./tmux.js";
-import type { ControlInput, RunResult, StartInput, WaitResult, WorkerMode } from "./types.js";
+import type { ControlInput, RunRecord, RunResult, StartInput, WaitResult, WorkerMode, WorkspaceKind } from "./types.js";
 import { registerWorkerBridge, resolveWorkerMode } from "./worker.js";
+import { GitWorktrees } from "./worktree.js";
+import { resolveWorkspace } from "./workspace.js";
 
 const ThinkingSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
@@ -72,11 +76,13 @@ export default function heishi(pi: ExtensionAPI): void {
 
   const tmux = new Tmux();
   const ipc = new IpcHub();
+  const worktrees = new GitWorktrees(getAgentDir());
   const extensionPath = fileURLToPath(import.meta.url);
   let coordinator: RunCoordinator | undefined;
   let delegationConfig: DelegationConfig = { models: [] };
   let delegationConfigError: string | undefined;
   let defaultMode: WorkerMode = "sub";
+  let defaultWorkspace: WorkspaceKind = "shared";
 
   const createCoordinator = (ctx: ExtensionContext): RunCoordinator => new RunCoordinator({
     cwd: ctx.cwd,
@@ -84,6 +90,7 @@ export default function heishi(pi: ExtensionAPI): void {
     piPath: "pi",
     tmux,
     ipc,
+    worktrees,
     persist: (record) => pi.appendEntry(RUN_ENTRY_TYPE, record),
     projectTrusted: ctx.isProjectTrusted(),
   });
@@ -98,7 +105,11 @@ export default function heishi(pi: ExtensionAPI): void {
     coordinator = createCoordinator(ctx);
     const startsNewSession = event.reason === "new" || event.reason === "fork";
     defaultMode = startsNewSession ? "sub" : restoreSessionMode(ctx.sessionManager.getBranch()) ?? "sub";
-    if (startsNewSession) pi.appendEntry(MODE_ENTRY_TYPE, { mode: "sub" });
+    defaultWorkspace = startsNewSession ? "shared" : restoreSessionWorkspace(ctx.sessionManager.getBranch()) ?? "shared";
+    if (startsNewSession) {
+      pi.appendEntry(MODE_ENTRY_TYPE, { mode: "sub" });
+      pi.appendEntry(WORKSPACE_ENTRY_TYPE, { workspace: "shared" });
+    }
     const loaded = await loadEffectiveConfig(
       join(getAgentDir(), "heishi.json"),
       join(ctx.cwd, CONFIG_DIR_NAME, "heishi.json"),
@@ -113,7 +124,7 @@ export default function heishi(pi: ExtensionAPI): void {
     coordinator.restore(reconciled);
     for (const run of reconciled) {
       const previous = restored.find((candidate) => candidate.runId === run.runId);
-      if (previous && (previous.status !== run.status || previous.paneState !== run.paneState)) {
+      if (previous && previous !== run) {
         pi.appendEntry(RUN_ENTRY_TYPE, run);
       }
     }
@@ -127,7 +138,7 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_start",
     label: "Start Subagent",
-    description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main uses an explicitly user-requested authenticated model or a deliberately selected pair from the Heishi delegation pool.",
+    description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main uses an explicitly requested model or a deliberately selected delegation pair and may use an isolated Git worktree workspace.",
     promptSnippet: "Start persistent interactive tmux subagents for delegated work",
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
@@ -138,8 +149,9 @@ export default function heishi(pi: ExtensionAPI): void {
       "Main mode loads normal Pi extensions, skills, tools, and prompt templates.",
       ...MAIN_MODEL_GUIDELINES,
       "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission defaults to `session` in sub mode and `window` in main mode.",
+      "The optional `workspace` parameter is independent of tmux placement. Main mode uses the current workspace default when it is omitted; sub mode always uses the shared checkout. An explicit `worktree` is valid only in main mode and isolates repository writes on a retained branch.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
-      "Concurrent `subagent_start` runs share the checkout and may write at the same time; assign non-overlapping work or use separate worktrees to avoid conflicting edits.",
+      "Concurrent shared-workspace writers must edit non-overlapping files. Use main-mode worktree workspaces when writers need isolated checkouts.",
       "After every successful `subagent_start`, use `subagent_control` first only when live interaction is needed, then use `subagent_wait` for every started run; otherwise use `subagent_wait` immediately. Do not inspect, implement, or answer the user until all waits return.",
     ],
     parameters: Type.Object({
@@ -155,9 +167,14 @@ export default function heishi(pi: ExtensionAPI): void {
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
         { description: "Optional worker placement. Omit unless the user explicitly requests one; omission defaults to session in sub mode and window in main mode" },
       )),
+      workspace: Type.Optional(Type.Union(
+        [Type.Literal("shared"), Type.Literal("worktree")],
+        { description: "Optional repository workspace. Main mode uses the current session default when omitted; sub mode always uses shared and rejects an explicit worktree" },
+      )),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const mode = params.mode ?? defaultMode;
+      const workspace = resolveWorkspace(mode, params.workspace, defaultWorkspace);
       if (mode === "sub") {
         const pairs = effectivePairs(ctx);
         if (pairs.length === 0) {
@@ -175,6 +192,7 @@ export default function heishi(pi: ExtensionAPI): void {
 
       const input: StartInput = {
         mode,
+        workspace,
         task: params.task,
       };
       if (params.model !== undefined) input.model = params.model;
@@ -188,8 +206,9 @@ export default function heishi(pi: ExtensionAPI): void {
       const alias = args.alias?.trim() || "random alias";
       const task = typeof args.task === "string" ? args.task : "";
       const mode = args.mode ? ` · ${args.mode}` : "";
+      const workspace = args.workspace ? ` · ${args.workspace}` : "";
       container.addChild(new Text(
-        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", `${mode} · ${args.model ?? "…"} / ${args.thinking ?? "…"}`)}`,
+        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", `${mode}${workspace} · ${args.model ?? "…"} / ${args.thinking ?? "…"}`)}`,
         0,
         0,
       ));
@@ -207,8 +226,8 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_control",
     label: "Control Subagent",
-    description: "Prompt, steer, follow up, abort, or resume a persistent subagent by its authoritative run UUID.",
-    promptSnippet: "Prompt, steer, follow up, abort, or resume a tmux subagent run",
+    description: "Prompt, steer, follow up, abort, resume, or clean up a persistent subagent by its authoritative run UUID.",
+    promptSnippet: "Prompt, steer, follow up, abort, resume, or clean up a tmux subagent run",
     promptGuidelines: [
       "Use `subagent_control` with the full authoritative run UUID returned by `subagent_start`; aliases are display-only.",
       "Include `message` when using `subagent_control` actions `prompt`, `steer`, or `follow_up`.",
@@ -217,6 +236,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Use `steer` only while a subagent is actively running and connected; do not use `steer` after `subagent_wait`. Resume it and use `prompt` or `follow_up` instead.",
       "After `prompt`, `follow_up`, or `steer`, use `subagent_wait` before the main agent inspects, implements, or answers with the delegated result.",
       "Do not assign write work to a sub-mode run through `prompt`, `follow_up`, or `steer`; start a main-mode run instead.",
+      "`subagent_control` action `cleanup` requires interactive TUI confirmation that names the run and worktree path. Non-interactive cleanup is rejected. Cleanup refuses local files, removes only the worktree, and retains its branch.",
     ],
     parameters: Type.Object({
       runId: Type.String({ description: "Full authoritative run UUID returned by subagent_start" }),
@@ -226,19 +246,27 @@ export default function heishi(pi: ExtensionAPI): void {
         Type.Literal("follow_up"),
         Type.Literal("abort"),
         Type.Literal("resume"),
+        Type.Literal("cleanup"),
       ], { description: "Control action to perform on the subagent run" }),
-      message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort and resume" })),
+      message: Type.Optional(Type.String({ description: "Required for prompt, steer, and follow_up; omitted for abort, resume, and cleanup" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const activeCoordinator = requireCoordinator();
+      if (params.action === "cleanup") {
+        return controlToolResult(
+          await cleanupWithConfirmation(activeCoordinator, params.runId, ctx),
+          params.action,
+        );
+      }
       const input: ControlInput = { runId: params.runId, action: params.action };
       if (params.message !== undefined) input.message = params.message;
       if (params.action === "prompt" || params.action === "follow_up" || params.action === "resume") {
-        const run = requireCoordinator().list().find((candidate) => candidate.runId === params.runId);
+        const run = activeCoordinator.list().find((candidate) => candidate.runId === params.runId);
         if (run?.mode === "sub" && !effectivePairs(ctx).some((pair) => pair.model === run.model && pair.thinking === run.thinking)) {
           throw new Error(`Subagent model/thinking pair is no longer allowed: ${run.model} / ${run.thinking}`);
         }
       }
-      return controlToolResult(await requireCoordinator().control(input), params.action);
+      return controlToolResult(await activeCoordinator.control(input), params.action);
     },
     renderCall(args, theme) {
       const runId = typeof args.runId === "string" ? shortRunId(args.runId) : "…";
@@ -302,6 +330,8 @@ export default function heishi(pi: ExtensionAPI): void {
     const modeGuidance = [
       `The current Heishi default mode is \`${defaultMode}\`.`,
       "Omitting subagent_start.mode uses this default. An explicit mode overrides it for that run.",
+      `The current Heishi main-mode workspace default is \`${defaultWorkspace}\`.`,
+      "Omitting subagent_start.workspace uses this default in main mode. Sub mode always uses the shared checkout and rejects an explicit worktree.",
     ].join("\n");
     const poolGuidance = pairs.length === 0
       ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode remains available when the user explicitly requests an authenticated model."
@@ -321,6 +351,17 @@ export default function heishi(pi: ExtensionAPI): void {
     getArgumentCompletions: heishiArgumentCompletions,
     handler: async (args, ctx) => {
       const command = args.trim();
+      if (command === "workspace" || command === "workspace shared" || command === "workspace worktree") {
+        if (command !== "workspace") {
+          const requested = command.slice("workspace ".length) as WorkspaceKind;
+          if (requested !== defaultWorkspace) {
+            defaultWorkspace = requested;
+            pi.appendEntry(WORKSPACE_ENTRY_TYPE, { workspace: defaultWorkspace });
+          }
+        }
+        ctx.ui.notify(`Heishi main-mode workspace: ${defaultWorkspace}`, "info");
+        return;
+      }
       if (command === "mode" || command === "mode sub" || command === "mode main") {
         const requested = command === "mode" ? (defaultMode === "sub" ? "main" : "sub") : command.slice(5) as WorkerMode;
         if (requested !== defaultMode) {
@@ -331,7 +372,7 @@ export default function heishi(pi: ExtensionAPI): void {
         return;
       }
       if (command !== "model") {
-        ctx.ui.notify("Usage: /heishi model | /heishi mode [sub|main]", "info");
+        ctx.ui.notify("Usage: /heishi model | /heishi mode [sub|main] | /heishi workspace [shared|worktree]", "info");
         return;
       }
       if (ctx.mode !== "tui") {
@@ -389,6 +430,14 @@ export default function heishi(pi: ExtensionAPI): void {
 }
 
 function heishiArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {
+  if (prefix.startsWith("workspace ")) {
+    const nestedPrefix = prefix.slice("workspace ".length);
+    const items = [
+      { value: "workspace shared", label: "shared" },
+      { value: "workspace worktree", label: "worktree" },
+    ].filter((item) => item.label.startsWith(nestedPrefix));
+    return items.length > 0 ? items : null;
+  }
   if (prefix.startsWith("mode ")) {
     const nestedPrefix = prefix.slice("mode ".length);
     const items = [
@@ -401,8 +450,39 @@ function heishiArgumentCompletions(prefix: string): Array<{ value: string; label
   const items = [
     { value: "model", label: "model" },
     { value: "mode", label: "mode" },
+    { value: "workspace", label: "workspace" },
   ].filter((item) => item.value.startsWith(prefix));
   return items.length > 0 ? items : null;
+}
+
+interface CleanupCoordinator {
+  validateCleanup(runId: string): Promise<RunRecord>;
+  control(input: ControlInput): Promise<RunResult>;
+}
+
+interface CleanupContext {
+  mode: ExtensionContext["mode"];
+  ui: Pick<ExtensionContext["ui"], "confirm">;
+}
+
+export async function cleanupWithConfirmation(
+  coordinator: CleanupCoordinator,
+  runId: string,
+  ctx: CleanupContext,
+): Promise<RunResult> {
+  if (ctx.mode !== "tui") {
+    throw new Error("Worktree cleanup requires confirmation in the interactive TUI");
+  }
+  const run = await coordinator.validateCleanup(runId);
+  if (!run.worktree) throw new Error("Worktree run has no prepared workspace to clean up");
+  const confirmed = await ctx.ui.confirm(
+    `Remove ${run.alias}'s worktree?`,
+    `Run: ${run.alias}\nPath: ${run.worktree.path}\nBranch ${run.worktree.branch} will be retained.`,
+  );
+  if (!confirmed) {
+    throw new Error(`Worktree cleanup cancelled for ${run.alias}: ${run.worktree.path}`);
+  }
+  return coordinator.control({ runId, action: "cleanup" });
 }
 
 interface RenderableResult {
@@ -445,9 +525,14 @@ function runStatusHeader(result: RunResult, theme: Theme): string {
     result.tmuxWindowId ? `window id ${result.tmuxWindowId}` : undefined,
     result.tmuxSessionId ? `session id ${result.tmuxSessionId}` : undefined,
   ].filter(Boolean).join(" · ");
+  const worktree = result.workspace === "worktree"
+    ? `\n  ${theme.fg("dim", result.worktree
+        ? `Worktree: ${result.worktree.path} · ${result.worktree.branch} · base ${result.worktree.baseCommit} · ${result.worktree.state}`
+        : "Worktree: not prepared")}`
+    : "";
   const metadata = location ? ` · ${location}` : "";
   const error = result.error ? `\n  ${theme.fg("error", result.error)}` : "";
-  return `${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(runIdentity(result)))}  ${theme.fg(color, result.status)}${theme.fg("dim", metadata)}${error}`;
+  return `${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(runIdentity(result)))}  ${theme.fg(color, result.status)}${theme.fg("dim", metadata)}${worktree}${error}`;
 }
 
 function toolResult(

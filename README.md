@@ -27,7 +27,7 @@ Restart Pi, then configure the delegation pool of model and thinking-level pairs
 Heishi gives Pi three tools:
 
 - `subagent_start` — start a managed worker in tmux
-- `subagent_control` — prompt, steer, follow up, abort, or resume a worker
+- `subagent_control` — prompt, steer, follow up, abort, resume, or clean up a worker workspace
 - `subagent_wait` — wait for a worker to finish and return its report
 
 Workers have two modes:
@@ -50,9 +50,17 @@ Main workers mirror the parent session's project trust. They load trusted extens
 
 Use `/subagent` to manage workers in the interactive overlay. Both modes prefer structured reports and fall back to the worker's final assistant response.
 
+### Worktree workspaces
+
+Workers use the shared checkout by default. Main-mode workers can instead use an isolated Git worktree by passing `workspace: "worktree"`. Set the main-mode session fallback with `/heishi workspace shared` or `/heishi workspace worktree`; bare `/heishi workspace` reports it. New and forked sessions default to `shared`, and an explicit `subagent_start.workspace` overrides the fallback in main mode. Sub mode always uses the shared checkout and rejects an explicit worktree.
+
+Heishi requires the source checkout to be clean, including untracked files. It creates branch `heishi/<run-id>` from the source checkout's exact HEAD and places the worktree at `<agent-dir>/heishi/worktrees/<repo-name>-<repo-id>/<run-id>`. Ignored files are not copied. The worktree and branch remain after the worker settles, waits, shuts down, or fails after launch. If startup fails before launch, Heishi removes a safely identified worktree registration and path when possible, but retains the generated branch and internal lease for manual recovery. Persisted worktree metadata records whether the worktree is present or removed, and the startup error warns that both refs were retained. Heishi never merges branches or deletes refs.
+
+After reviewing or integrating the work yourself, use `subagent_control` action `cleanup` from the interactive TUI. Heishi displays a confirmation naming the run and exact worktree path, and does not call cleanup unless you accept it. Non-interactive cleanup is rejected. Cleanup uses ordinary `git worktree remove` only when a settled worktree contains no modified, untracked, or ignored files. It also requires a verified closed pane and retains the branch and internal lease. Resume recreates an explicitly removed worktree from that retained branch at the same path. Heishi refuses missing or inconsistent workspace state instead of pruning or overwriting it. No Heishi tool deletes refs.
+
 By default, sub workers open in a detached window in the `heishi-subagents` tmux session, while main workers open in a detached window in the current tmux session. An explicit placement can open either mode in the background session or in the current tmux session as a pane or detached window.
 
-Subagents share the current checkout. Run concurrent writers only on separate files or worktrees.
+Shared-workspace subagents use the current checkout. Run concurrent shared writers only on separate files; use main-mode worktree workspaces for isolated checkouts.
 
 ### Delegation contract
 

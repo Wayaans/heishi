@@ -8,10 +8,15 @@ class FakeExecutor implements CommandExecutor {
   sessionExists = false;
   raceOnSessionCreate = false;
   raceOnWindowCreate = false;
+  paneList = "%17\n";
+  launchOutput = "%17 @3 $1\n";
+  failPaneList = false;
 
   async exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
     this.calls.push({ command, args });
     if (this.failTitle && args[0] === "select-pane") throw new Error("title failed");
+    if (this.failPaneList && args[0] === "list-panes") throw new Error("tmux server unavailable");
+    if (args[0] === "list-panes") return { stdout: this.paneList, stderr: "" };
     if (args[0] === "has-session" && !this.sessionExists) throw new Error("session not found");
     if (args[0] === "new-session" && this.raceOnSessionCreate) {
       this.sessionExists = true;
@@ -23,7 +28,7 @@ class FakeExecutor implements CommandExecutor {
       throw new Error("session disappeared");
     }
     if (args[0] === "split-window" || args[0] === "new-window" || args[0] === "new-session") {
-      return { stdout: "%17 @3 $1\n", stderr: "" };
+      return { stdout: this.launchOutput, stderr: "" };
     }
     return { stdout: "$1\n", stderr: "" };
   }
@@ -60,6 +65,24 @@ describe("tmux adapter", () => {
     const shellCommand = launch?.args.at(-1) ?? "";
     assert.equal(shellCommand, "exec 'pi' '--model' 'provider/model'\"'\"'; touch /tmp/pwned; '\"'\"''");
     assert.equal(shellCommand.includes("task text"), false);
+  });
+
+  it("rejects nonnumeric or extra tmux launch IDs", async () => {
+    const executor = new FakeExecutor();
+    const tmux = new Tmux(executor, { TMUX: "/tmp/tmux-501/default,1,0" });
+    const launch = () => tmux.launch({
+      placement: "pane",
+      cwd: "/work/repo",
+      title: "Atalanta · a1b2c3",
+      command: ["pi"],
+      environment: {},
+    });
+
+    executor.launchOutput = "%bad @3 $1\n";
+    await assert.rejects(launch, /did not return pane, window, and session IDs/u);
+    executor.launchOutput = "%17 @3 $1 extra\n";
+    await assert.rejects(launch, /did not return pane, window, and session IDs/u);
+    assert.deepEqual(executor.calls.at(-1), { command: "tmux", args: ["kill-pane", "-t", "%17"] });
   });
 
   it("creates a detached named session with the worker as its first window", async () => {
@@ -140,6 +163,17 @@ describe("tmux adapter", () => {
     assert.deepEqual(executor.calls.map((call) => call.args[0]), [
       "has-session", "new-window", "has-session", "new-session", "select-pane",
     ]);
+  });
+
+  it("distinguishes an absent pane from a failed existence check", async () => {
+    const executor = new FakeExecutor();
+    const tmux = new Tmux(executor, { TMUX: "/tmp/tmux-501/default,1,0" });
+
+    assert.equal(await tmux.exists("%17"), true);
+    executor.paneList = "%18\n";
+    assert.equal(await tmux.exists("%17"), false);
+    executor.failPaneList = true;
+    await assert.rejects(() => tmux.exists("%17"), /server unavailable/u);
   });
 
   it("kills a created pane when title setup fails", async () => {

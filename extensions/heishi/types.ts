@@ -1,6 +1,8 @@
 import type { Placement, ThinkingLevel } from "./tmux.js";
 
 export type WorkerMode = "sub" | "main";
+export type WorkspaceKind = "shared" | "worktree";
+export type WorktreeState = "present" | "removed";
 export type RunStatus = "created" | "starting" | "running" | "completed" | "blocked" | "failed" | "cancelled";
 export type PaneState = "open" | "closed" | "disconnected";
 
@@ -23,9 +25,32 @@ export interface SubagentReport {
   structured: boolean;
 }
 
+interface WorktreeRecordBase {
+  path: string;
+  branch: string;
+  baseCommit: string;
+  gitCommonDir: string;
+  repositoryName: string;
+  relativeCwd: string;
+}
+
+export interface PresentWorktreeRecord extends WorktreeRecordBase {
+  state: "present";
+  resumeCommit?: never;
+}
+
+export interface RemovedWorktreeRecord extends WorktreeRecordBase {
+  state: "removed";
+  resumeCommit: string;
+}
+
+export type WorktreeRecord = PresentWorktreeRecord | RemovedWorktreeRecord;
+
 export interface RunRecord {
-  version: 2;
+  version: 3;
   mode: WorkerMode;
+  workspace: WorkspaceKind;
+  worktree?: WorktreeRecord;
   runId: string;
   alias: string;
   taskPreview: string;
@@ -55,9 +80,10 @@ export interface StartInput {
   model?: string;
   thinking?: ThinkingLevel;
   placement?: Placement;
+  workspace?: WorkspaceKind;
 }
 
-export type ControlAction = "prompt" | "steer" | "follow_up" | "abort" | "focus" | "resume";
+export type ControlAction = "prompt" | "steer" | "follow_up" | "abort" | "focus" | "resume" | "cleanup";
 
 export interface ControlInput {
   runId: string;
@@ -75,6 +101,8 @@ export interface RunResult {
   workerSessionId?: string;
   workerSessionFile?: string;
   mode?: "main";
+  workspace?: "worktree";
+  worktree?: Pick<WorktreeRecord, "path" | "branch" | "baseCommit" | "state">;
   model?: string;
   thinking?: ThinkingLevel;
   report?: SubagentReport;
@@ -92,6 +120,17 @@ export function resultFromRun(run: RunRecord): RunResult {
     status: run.status,
   };
   if (run.mode === "main") result.mode = "main";
+  if (run.workspace === "worktree") {
+    result.workspace = "worktree";
+  }
+  if (run.worktree) {
+    result.worktree = {
+      path: run.worktree.path,
+      branch: run.worktree.branch,
+      baseCommit: run.worktree.baseCommit,
+      state: run.worktree.state,
+    };
+  }
   if (run.model !== undefined) result.model = run.model;
   if (run.thinking !== undefined) result.thinking = run.thinking;
   if (run.tmuxTarget !== undefined) result.tmuxTarget = run.tmuxTarget;

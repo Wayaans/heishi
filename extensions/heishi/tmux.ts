@@ -13,7 +13,7 @@ export interface CommandExecutor {
 
 export class ProcessCommandExecutor implements CommandExecutor {
   async exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-    return execFileAsync(command, args, { encoding: "utf8" });
+    return execFileAsync(command, args, { encoding: "utf8", timeout: 30_000 });
   }
 }
 
@@ -105,8 +105,15 @@ export class Tmux implements TmuxAdapter {
       args = completeArgs(namedSessionArgs(retryOperation, spec.sessionName));
       result = await this.executor.exec("tmux", args);
     }
-    const [paneId, windowId, sessionId] = result.stdout.trim().split(" ");
-    if (!paneId?.startsWith("%") || !windowId?.startsWith("@") || !sessionId?.startsWith("$")) {
+    const ids = result.stdout.trim().split(/\s+/u);
+    const [paneId, windowId, sessionId] = ids;
+    if (ids.length !== 3
+      || !isTmuxId(paneId, "%")
+      || !isTmuxId(windowId, "@")
+      || !isTmuxId(sessionId, "$")) {
+      if (isTmuxId(paneId, "%")) {
+        await this.executor.exec("tmux", ["kill-pane", "-t", paneId]).catch(() => undefined);
+      }
       throw new Error(`tmux did not return pane, window, and session IDs: ${result.stdout.trim()}`);
     }
     try {
@@ -119,12 +126,8 @@ export class Tmux implements TmuxAdapter {
   }
 
   async exists(target: string): Promise<boolean> {
-    try {
-      await this.executor.exec("tmux", ["display-message", "-p", "-t", target, "#{pane_id}"]);
-      return true;
-    } catch {
-      return false;
-    }
+    const result = await this.executor.exec("tmux", ["list-panes", "-a", "-F", "#{pane_id}"]);
+    return result.stdout.split("\n").some((paneId) => paneId.trim() === target);
   }
 
   async focus(target: string): Promise<void> {
@@ -183,6 +186,10 @@ function buildMainPiCommand(options: PiCommandOptions): string[] {
   if (options.thinking) command.push("--thinking", options.thinking);
   command.push("--name", options.name, options.projectTrusted ? "--approve" : "--no-approve");
   return command;
+}
+
+function isTmuxId(value: string | undefined, prefix: "%" | "@" | "$"): value is string {
+  return value?.startsWith(prefix) === true && /^[0-9]+$/u.test(value.slice(1));
 }
 
 function errorMessage(error: unknown): string {

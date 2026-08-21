@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import heishi from "./index.js";
+import heishi, { cleanupWithConfirmation } from "./index.js";
+import type { ControlInput, RunRecord, RunResult } from "./types.js";
 
 interface RegisteredTool {
   name: string;
@@ -123,7 +124,7 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("otherwise use `subagent_wait` immediately")
         && guideline.includes("Do not inspect, implement, or answer");
     }));
-    assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping work") && guideline.includes("worktrees")));
+    assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping files") && guideline.includes("worktree workspaces")));
     assert.ok(control.promptGuidelines?.some((guideline) => {
       return guideline.includes("After `subagent_wait` returns")
         && guideline.includes("`resume`")
@@ -147,6 +148,11 @@ describe("Heishi tool prompt metadata", () => {
       return guideline.includes("Do not assign write work to a sub-mode run")
         && guideline.includes("start a main-mode run instead");
     }));
+    assert.ok(control.promptGuidelines?.some((guideline) => {
+      return guideline.includes("requires interactive TUI confirmation")
+        && guideline.includes("names the run and worktree path")
+        && guideline.includes("Non-interactive cleanup is rejected");
+    }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("`placement` parameter is optional")
         && guideline.includes("Omit it unless the user explicitly requests")
@@ -163,15 +169,105 @@ describe("Heishi tool prompt metadata", () => {
     );
     assert.deepEqual(
       control.parameters.properties?.["action"]?.anyOf?.map((action) => action.const),
-      ["prompt", "steer", "follow_up", "abort", "resume"],
+      ["prompt", "steer", "follow_up", "abort", "resume", "cleanup"],
     );
     assert.deepEqual(
       start.parameters.properties?.["mode"]?.anyOf?.map((mode) => mode.const),
       ["sub", "main"],
     );
+    assert.deepEqual(
+      start.parameters.properties?.["workspace"]?.anyOf?.map((workspace) => workspace.const),
+      ["shared", "worktree"],
+    );
     assert.equal(start.parameters.required?.includes("model") ?? false, false);
     assert.equal(start.parameters.required?.includes("thinking") ?? false, false);
     assert.deepEqual(tools.map((tool) => tool.name), ["subagent_start", "subagent_control", "subagent_wait"]);
+  });
+
+  it("runs cleanup only after interactive confirmation", async () => {
+    const { coordinator, controls, run } = cleanupFixture();
+    const confirmations: Array<{ title: string; message: string }> = [];
+
+    const result = await cleanupWithConfirmation(coordinator, run.runId, {
+      mode: "tui",
+      ui: {
+        async confirm(title, message) {
+          confirmations.push({ title, message });
+          return true;
+        },
+      },
+    });
+
+    assert.equal(result.worktree?.state, "removed");
+    assert.deepEqual(coordinator.validations, [run.runId]);
+    assert.deepEqual(controls, [{ runId: run.runId, action: "cleanup" }]);
+    assert.match(confirmations[0]?.title ?? "", new RegExp(run.alias, "u"));
+    assert.match(confirmations[0]?.message ?? "", new RegExp(run.alias, "u"));
+    assert.match(confirmations[0]?.message ?? "", new RegExp(run.worktree?.path ?? "missing", "u"));
+  });
+
+  it("does not call cleanup when interactive confirmation is declined", async () => {
+    const { coordinator, controls, run } = cleanupFixture();
+
+    await assert.rejects(
+      () => cleanupWithConfirmation(coordinator, run.runId, {
+        mode: "tui",
+        ui: { confirm: async () => false },
+      }),
+      /cleanup cancelled/u,
+    );
+
+    assert.deepEqual(coordinator.validations, [run.runId]);
+    assert.deepEqual(controls, []);
+  });
+
+  it("does not prompt when cleanup preflight rejects active, open, or dirty worktrees", async () => {
+    for (const options of [
+      { run: { status: "running" as const }, expected: /settled run/u },
+      { run: { paneState: "open" as const }, expected: /pane is closed/u },
+      { validationError: new Error("Worktree has modified, untracked, or ignored files; cleanup refused"), expected: /cleanup refused/u },
+    ]) {
+      const { coordinator, controls, run } = cleanupFixture(options);
+      let confirmations = 0;
+
+      await assert.rejects(
+        () => cleanupWithConfirmation(coordinator, run.runId, {
+          mode: "tui",
+          ui: {
+            async confirm() {
+              confirmations += 1;
+              return true;
+            },
+          },
+        }),
+        options.expected,
+      );
+
+      assert.equal(confirmations, 0);
+      assert.deepEqual(controls, []);
+    }
+  });
+
+  it("rejects non-TUI cleanup without confirmation or coordinator cleanup", async () => {
+    const { coordinator, controls, run } = cleanupFixture();
+    let confirmations = 0;
+
+    await assert.rejects(
+      () => cleanupWithConfirmation(coordinator, run.runId, {
+        mode: "print",
+        ui: {
+          async confirm() {
+            confirmations += 1;
+            return true;
+          },
+        },
+      }),
+      /requires confirmation in the interactive TUI/u,
+    );
+
+    assert.equal(confirmations, 0);
+    assert.deepEqual(coordinator.validations, []);
+    assert.deepEqual(controls, []);
   });
 
   it("injects the mode and main-model selection policies into the main agent prompt", () => {
@@ -225,17 +321,24 @@ describe("Heishi tool prompt metadata", () => {
     await command.handler("mode", ctx);
     await command.handler("mode main", ctx);
     await command.handler("mode sub", ctx);
+    await command.handler("workspace", ctx);
+    await command.handler("workspace worktree", ctx);
+    await command.handler("workspace", ctx);
     await command.handler("invalid", ctx);
 
     assert.deepEqual(entries, [
       { type: "heishi:mode", data: { mode: "main" } },
       { type: "heishi:mode", data: { mode: "sub" } },
+      { type: "heishi:workspace", data: { workspace: "worktree" } },
     ]);
     assert.deepEqual(notifications, [
       "Heishi default mode: main",
       "Heishi default mode: main",
       "Heishi default mode: sub",
-      "Usage: /heishi model | /heishi mode [sub|main]",
+      "Heishi main-mode workspace: shared",
+      "Heishi main-mode workspace: worktree",
+      "Heishi main-mode workspace: worktree",
+      "Usage: /heishi model | /heishi mode [sub|main] | /heishi workspace [shared|worktree]",
     ]);
   });
 
@@ -262,12 +365,17 @@ describe("Heishi tool prompt metadata", () => {
       /coordinator is not initialized/u,
     );
     await commands.get("heishi")!.handler("mode main", ctx);
+    await commands.get("heishi")!.handler("workspace worktree", ctx);
     await assert.rejects(
       () => start("call-2", { task: "Inspect" }, undefined, undefined, ctx),
       /coordinator is not initialized/u,
     );
     await assert.rejects(
-      () => start("call-3", { mode: "sub", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
+      () => start("call-3", { mode: "sub", workspace: "worktree", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
+      /worktree workspace is available only in main mode/ui,
+    );
+    await assert.rejects(
+      () => start("call-4", { mode: "sub", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
       /delegation models are not configured/u,
     );
   });
@@ -317,10 +425,11 @@ describe("Heishi tool prompt metadata", () => {
     }
   });
 
-  it("restores existing session mode and resets new and forked sessions to sub", async () => {
+  it("restores session defaults and resets new and forked sessions", async () => {
     const sessionHandlers: Array<(event: unknown, ctx: unknown) => Promise<void>> = [];
     const commands = new Map<string, RegisteredCommand>();
     const entries: Array<{ type: string; data: unknown }> = [];
+    const notifications: string[] = [];
     const pi = {
       on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
         if (event === "session_start") sessionHandlers.push(handler);
@@ -332,7 +441,10 @@ describe("Heishi tool prompt metadata", () => {
     heishi(pi);
     const sessionStart = sessionHandlers[0];
     assert.ok(sessionStart);
-    const branch = [{ type: "custom", customType: "heishi:mode", data: { mode: "main" } }];
+    const branch = [
+      { type: "custom", customType: "heishi:mode", data: { mode: "main" } },
+      { type: "custom", customType: "heishi:workspace", data: { workspace: "worktree" } },
+    ];
     const ctx = {
       cwd: "/repo",
       mode: "tui",
@@ -340,17 +452,22 @@ describe("Heishi tool prompt metadata", () => {
       isProjectTrusted: () => false,
       modelRegistry: { getAvailable: () => [] },
       sessionManager: { getBranch: () => branch },
-      ui: { notify() {} },
+      ui: { notify(message: string) { notifications.push(message); } },
     };
 
     await sessionStart({ reason: "startup" }, ctx);
+    await commands.get("heishi")!.handler("workspace", ctx);
+    assert.equal(notifications.at(-1), "Heishi main-mode workspace: worktree");
     await commands.get("heishi")!.handler("mode", ctx);
     assert.deepEqual(entries.at(-1), { type: "heishi:mode", data: { mode: "sub" } });
 
     for (const reason of ["new", "fork"]) {
       entries.length = 0;
       await sessionStart({ reason }, ctx);
-      assert.deepEqual(entries, [{ type: "heishi:mode", data: { mode: "sub" } }]);
+      assert.deepEqual(entries, [
+        { type: "heishi:mode", data: { mode: "sub" } },
+        { type: "heishi:workspace", data: { workspace: "shared" } },
+      ]);
     }
   });
 
@@ -365,10 +482,12 @@ describe("Heishi tool prompt metadata", () => {
     const complete = commands.get("heishi")?.getArgumentCompletions;
     assert.ok(complete);
 
-    assert.deepEqual(complete("" )?.map((item) => item.value), ["model", "mode"]);
+    assert.deepEqual(complete("" )?.map((item) => item.value), ["model", "mode", "workspace"]);
     assert.deepEqual(complete("m")?.map((item) => item.value), ["model", "mode"]);
     assert.deepEqual(complete("mode ")?.map((item) => item.value), ["mode sub", "mode main"]);
     assert.deepEqual(complete("mode m")?.map((item) => item.value), ["mode main"]);
+    assert.deepEqual(complete("workspace ")?.map((item) => item.value), ["workspace shared", "workspace worktree"]);
+    assert.deepEqual(complete("workspace w")?.map((item) => item.value), ["workspace worktree"]);
   });
 
   it("registers the bridge and normal Heishi tools together in main workers", async () => {
@@ -483,6 +602,39 @@ describe("Heishi tool prompt metadata", () => {
     assert.doesNotMatch(prompted, /openai-codex\/gpt-5\.6-luna|high/u);
   });
 
+  it("renders worktree path, branch, base commit, and state", () => {
+    const tools: RegisteredTool[] = [];
+    const pi = {
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI;
+    heishi(pi);
+
+    const renderResult = requireTool(tools, "subagent_start").renderResult;
+    assert.ok(renderResult);
+    const rendered = renderResult({
+      content: [],
+      details: {
+        runId: "12345678-1234-1234-1234-123456789abc",
+        alias: "Atalanta",
+        status: "running",
+        workspace: "worktree",
+        worktree: {
+          path: "/agent/heishi/worktrees/repo-abc/run-id",
+          branch: "heishi/run-id",
+          baseCommit: "abc123",
+          state: "present",
+        },
+      },
+    }, {}, {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    }).render(200).join("\n");
+
+    assert.match(rendered, /Worktree: \/agent\/heishi\/worktrees\/repo-abc\/run-id · heishi\/run-id · base abc123 · present/u);
+  });
+
   it("renders running location metadata without repeating model and thinking", () => {
     const tools: RegisteredTool[] = [];
     const pi = {
@@ -516,6 +668,80 @@ describe("Heishi tool prompt metadata", () => {
     assert.doesNotMatch(rendered, /openai\/model|high/u);
   });
 });
+
+function cleanupFixture(options: {
+  run?: Partial<RunRecord>;
+  validationError?: Error;
+} = {}): {
+  coordinator: {
+    validations: string[];
+    validateCleanup(runId: string): Promise<RunRecord>;
+    control(input: ControlInput): Promise<RunResult>;
+  };
+  controls: ControlInput[];
+  run: RunRecord;
+} {
+  const worktree = {
+    path: "/agent/heishi/worktrees/repo-abc/run-cleanup",
+    branch: "heishi/run-cleanup",
+    baseCommit: "abc123",
+    state: "present" as const,
+    gitCommonDir: "/repo/.git",
+    repositoryName: "repo",
+    relativeCwd: ".",
+  };
+  const run: RunRecord = {
+    version: 3,
+    mode: "main",
+    workspace: "worktree",
+    worktree,
+    runId: "run-cleanup",
+    alias: "Atalanta",
+    taskPreview: "Implement",
+    cwd: "/repo",
+    placement: "window",
+    status: "completed",
+    paneState: "closed",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+    ...options.run,
+  };
+  const controls: ControlInput[] = [];
+  const validations: string[] = [];
+  return {
+    run,
+    controls,
+    coordinator: {
+      validations,
+      async validateCleanup(runId) {
+        validations.push(runId);
+        if (options.validationError) throw options.validationError;
+        if (run.status === "created" || run.status === "starting" || run.status === "running") {
+          throw new Error("Worktree cleanup requires a settled run");
+        }
+        if (run.paneState !== "closed") {
+          throw new Error("Verify the subagent pane is closed before worktree cleanup");
+        }
+        return run;
+      },
+      async control(input) {
+        controls.push(input);
+        return {
+          runId: run.runId,
+          alias: run.alias,
+          status: run.status,
+          workspace: "worktree",
+          worktree: {
+            path: worktree.path,
+            branch: worktree.branch,
+            baseCommit: worktree.baseCommit,
+            state: "removed",
+          },
+        };
+      },
+    },
+  };
+}
 
 function testModel(provider: string, id: string): Model<any> {
   return {
