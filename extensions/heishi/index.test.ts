@@ -109,15 +109,17 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("final report");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("any authenticated model explicitly requested by the user")
+      return guideline.includes("first use any authenticated model or thinking level explicitly requested by the user")
         && guideline.includes("outside the Heishi delegation pool");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("user does not specify a main-mode model")
-        && guideline.includes("exact model/thinking pair")
-        && guideline.includes("best fits the task")
-        && guideline.includes("do not select randomly")
-        && guideline.includes("Pi's default model");
+      return guideline.includes("does not explicitly request a main-mode model or thinking level")
+        && guideline.includes("parent session's exact active model and thinking level");
+    }));
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("delegation pool only as the final fallback")
+        && guideline.includes("parent session's exact model/thinking pair is unavailable")
+        && guideline.includes("best fits the task");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("use `subagent_control` first only when live interaction is needed")
@@ -273,7 +275,12 @@ describe("Heishi tool prompt metadata", () => {
   it("injects the mode and main-model selection policies into the main agent prompt", () => {
     type BeforeAgentStart = (
       event: { systemPrompt: string },
-      ctx: { modelRegistry: { getAvailable(): Model<any>[] }; scopedModels: [] },
+      ctx: {
+        modelRegistry: { getAvailable(): Model<any>[] };
+        scopedModels: [];
+        model: Model<any>;
+        thinkingLevel: "high";
+      },
     ) => { systemPrompt: string };
     let beforeAgentStart: BeforeAgentStart | undefined;
     const pi = {
@@ -288,7 +295,12 @@ describe("Heishi tool prompt metadata", () => {
     assert.ok(beforeAgentStart);
     const result = beforeAgentStart(
       { systemPrompt: "Base prompt" },
-      { modelRegistry: { getAvailable: () => [] }, scopedModels: [] },
+      {
+        modelRegistry: { getAvailable: () => [] },
+        scopedModels: [],
+        model: testModel("provider", "session-model"),
+        thinkingLevel: "high",
+      },
     );
 
     assert.match(result.systemPrompt, /classify the task by its intended repository side effects/u);
@@ -298,9 +310,10 @@ describe("Heishi tool prompt metadata", () => {
     assert.match(result.systemPrompt, /Use `sub` mode for read-only work/u);
     assert.match(result.systemPrompt, /Use `main` mode for write work/u);
     assert.match(result.systemPrompt, /pass `mode` explicitly/u);
-    assert.match(result.systemPrompt, /any authenticated model explicitly requested by the user/u);
-    assert.match(result.systemPrompt, /user does not specify a main-mode model/u);
-    assert.match(result.systemPrompt, /do not select randomly or rely on Pi's default model/u);
+    assert.match(result.systemPrompt, /first use any authenticated model or thinking level explicitly requested by the user/u);
+    assert.match(result.systemPrompt, /use the parent session's exact active model and thinking level/u);
+    assert.match(result.systemPrompt, /delegation pool only as the final fallback/u);
+    assert.match(result.systemPrompt, /provider\/session-model \/ high/u);
   });
 
   it("toggles and persists the session default mode", async () => {

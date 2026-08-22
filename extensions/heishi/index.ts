@@ -17,6 +17,7 @@ import {
   availableModelChoices,
   loadConfig,
   loadEffectiveConfig,
+  modelReference,
   saveConfig,
   validateMainOverrides,
   type DelegationConfig,
@@ -42,12 +43,13 @@ import { resolveWorkspace } from "./workspace.js";
 
 const ThinkingSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
-  { description: "Optional thinking level. Required for sub mode and when main mode chooses from the Heishi delegation pool; an explicitly user-requested main model may omit it" },
+  { description: "Optional thinking level. Required for sub mode. In main mode, prioritize an explicit user request, then the parent session's exact level, and use a delegation-pool level only as the final fallback" },
 );
 
 const MAIN_MODEL_GUIDELINES = [
-  "In main mode, use any authenticated model explicitly requested by the user, even when it is outside the Heishi delegation pool.",
-  "When the user does not specify a main-mode model, deliberately choose and pass the exact model/thinking pair from the Heishi delegation pool that best fits the task; do not select randomly or rely on Pi's default model.",
+  "In main mode, first use any authenticated model or thinking level explicitly requested by the user, even when the model is outside the Heishi delegation pool.",
+  "When the user does not explicitly request a main-mode model or thinking level, use the parent session's exact active model and thinking level.",
+  "Use the Heishi delegation pool only as the final fallback when the parent session's exact model/thinking pair is unavailable; deliberately choose and pass the exact pool pair that best fits the task.",
 ] as const;
 
 const TASK_MODE_GUIDELINES = [
@@ -138,7 +140,7 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_start",
     label: "Start Subagent",
-    description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main uses an explicitly requested model or a deliberately selected delegation pair and may use an isolated Git worktree workspace.",
+    description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main prioritizes a user-requested pair, then the parent session's exact pair, and finally a delegation-pool pair. Main may use an isolated Git worktree workspace.",
     promptSnippet: "Start persistent interactive tmux subagents for delegated work",
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
@@ -161,7 +163,7 @@ export default function heishi(pi: ExtensionAPI): void {
       )),
       task: Type.String({ description: "Self-contained delegated brief with objective, background and decisions, scope and exclusions, relevant paths or symbols, constraints and assumptions, expected deliverable, and verification; the worker receives no parent conversation" }),
       alias: Type.Optional(Type.String({ description: "Optional display alias; if omitted, a Greek mythological name is chosen" })),
-      model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode. In main mode, use an explicitly user-requested authenticated model or choose a model/thinking pair from the Heishi delegation pool" })),
+      model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode. In main mode, prioritize an explicit user request, then the parent session's exact model, and use the delegation pool only as the final fallback" })),
       thinking: Type.Optional(ThinkingSchema),
       placement: Type.Optional(Type.Union(
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
@@ -343,7 +345,10 @@ export default function heishi(pi: ExtensionAPI): void {
     const taskModeGuidance = TASK_MODE_GUIDELINES.join("\n");
     const delegationBriefGuidance = DELEGATION_BRIEF_GUIDELINES.join("\n");
     const mainModelGuidance = MAIN_MODEL_GUIDELINES.join("\n");
-    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${poolGuidance}` };
+    const sessionModelGuidance = ctx.model && ctx.thinkingLevel
+      ? `The parent session's exact active model/thinking pair is ${modelReference(ctx.model)} / ${ctx.thinkingLevel}.`
+      : "The parent session's exact active model/thinking pair is unavailable; use the Heishi delegation pool as the final fallback for main mode.";
+    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${sessionModelGuidance}\n${poolGuidance}` };
   });
 
   pi.registerCommand("heishi", {

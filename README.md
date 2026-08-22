@@ -33,7 +33,7 @@ Heishi gives Pi three tools:
 Workers have two modes:
 
 - `sub` (default) uses Heishi's fast, constrained resource profile and requires a model/thinking pair configured through `/heishi model`.
-- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. It can use any authenticated model explicitly requested by the user. Otherwise, the agent deliberately chooses the best-fitting model/thinking pair from the configured delegation pool instead of selecting randomly or using Pi's default model. It can delegate recursively.
+- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. Model selection follows this priority: values explicitly requested by the user, the parent session's exact active model and thinking level, then a deliberately selected pair from the configured delegation pool as the final fallback. It can delegate recursively.
 
 Choose a mode by the task's intended repository side effects, not by keywords:
 
