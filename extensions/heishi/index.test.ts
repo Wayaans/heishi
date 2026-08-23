@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import heishi, { cleanupWithConfirmation } from "./index.js";
+import { WorktreeCleanupApproval } from "./cleanup.js";
+import heishi from "./index.js";
 import type { ControlInput, RunRecord, RunResult } from "./types.js";
 
 interface RegisteredTool {
@@ -151,9 +152,9 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("start a main-mode run instead");
     }));
     assert.ok(control.promptGuidelines?.some((guideline) => {
-      return guideline.includes("requires interactive TUI confirmation")
-        && guideline.includes("names the run and worktree path")
-        && guideline.includes("Non-interactive cleanup is rejected");
+      return guideline.includes("configured worktree approval policy")
+        && guideline.includes("queues interactive confirmations")
+        && guideline.includes("allow mode skips the prompt");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("`placement` parameter is optional")
@@ -190,7 +191,7 @@ describe("Heishi tool prompt metadata", () => {
     const { coordinator, controls, run } = cleanupFixture();
     const confirmations: Array<{ title: string; message: string }> = [];
 
-    const result = await cleanupWithConfirmation(coordinator, run.runId, {
+    const result = await new WorktreeCleanupApproval().execute(coordinator, run.runId, "ask", {
       mode: "tui",
       ui: {
         async confirm(title, message) {
@@ -212,7 +213,7 @@ describe("Heishi tool prompt metadata", () => {
     const { coordinator, controls, run } = cleanupFixture();
 
     await assert.rejects(
-      () => cleanupWithConfirmation(coordinator, run.runId, {
+      () => new WorktreeCleanupApproval().execute(coordinator, run.runId, "ask", {
         mode: "tui",
         ui: { confirm: async () => false },
       }),
@@ -233,7 +234,7 @@ describe("Heishi tool prompt metadata", () => {
       let confirmations = 0;
 
       await assert.rejects(
-        () => cleanupWithConfirmation(coordinator, run.runId, {
+        () => new WorktreeCleanupApproval().execute(coordinator, run.runId, "ask", {
           mode: "tui",
           ui: {
             async confirm() {
@@ -255,7 +256,7 @@ describe("Heishi tool prompt metadata", () => {
     let confirmations = 0;
 
     await assert.rejects(
-      () => cleanupWithConfirmation(coordinator, run.runId, {
+      () => new WorktreeCleanupApproval().execute(coordinator, run.runId, "ask", {
         mode: "print",
         ui: {
           async confirm() {
@@ -270,6 +271,59 @@ describe("Heishi tool prompt metadata", () => {
     assert.equal(confirmations, 0);
     assert.deepEqual(coordinator.validations, []);
     assert.deepEqual(controls, []);
+  });
+
+  it("allows configured cleanup without a prompt in non-interactive mode", async () => {
+    const { coordinator, controls, run } = cleanupFixture();
+    let confirmations = 0;
+
+    await new WorktreeCleanupApproval().execute(coordinator, run.runId, "allow", {
+      mode: "print",
+      ui: {
+        async confirm() {
+          confirmations += 1;
+          return false;
+        },
+      },
+    });
+
+    assert.equal(confirmations, 0);
+    assert.deepEqual(controls, [{ runId: run.runId, action: "cleanup" }]);
+  });
+
+  it("queues parallel cleanup confirmations and continues after each decision", async () => {
+    const first = cleanupFixture({ run: { runId: "run-first", alias: "Atalanta" } });
+    const second = cleanupFixture({ run: { runId: "run-second", alias: "Circe" } });
+    const resolvers: Array<(confirmed: boolean) => void> = [];
+    const titles: string[] = [];
+    const approval = new WorktreeCleanupApproval();
+    const ctx = {
+      mode: "tui" as const,
+      ui: {
+        confirm(title: string) {
+          titles.push(title);
+          return new Promise<boolean>((resolve) => resolvers.push(resolve));
+        },
+      },
+    };
+
+    const firstCleanup = approval.execute(first.coordinator, first.run.runId, "ask", ctx);
+    const secondCleanup = approval.execute(second.coordinator, second.run.runId, "ask", ctx);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(titles.length, 1);
+    assert.match(titles[0] ?? "", /Atalanta/u);
+    assert.deepEqual(second.coordinator.validations, []);
+
+    resolvers[0]?.(false);
+    await assert.rejects(firstCleanup, /cleanup cancelled/u);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(titles.length, 2);
+    assert.match(titles[1] ?? "", /Circe/u);
+
+    resolvers[1]?.(true);
+    await secondCleanup;
+    assert.deepEqual(first.controls, []);
+    assert.deepEqual(second.controls, [{ runId: second.run.runId, action: "cleanup" }]);
   });
 
   it("injects the mode and main-model selection policies into the main agent prompt", () => {
@@ -316,53 +370,37 @@ describe("Heishi tool prompt metadata", () => {
     assert.match(result.systemPrompt, /provider\/session-model \/ high/u);
   });
 
-  it("toggles and persists the session default mode", async () => {
+  it("accepts only the interactive settings command", async () => {
     const commands = new Map<string, RegisteredCommand>();
-    const entries: Array<{ type: string; data: unknown }> = [];
     const notifications: string[] = [];
     const pi = {
       on() {},
       registerTool() {},
-      appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
       registerCommand(name: string, command: RegisteredCommand) { commands.set(name, command); },
     } as unknown as ExtensionAPI;
     heishi(pi);
     const command = commands.get("heishi");
     assert.ok(command);
-    const ctx = { ui: { notify(message: string) { notifications.push(message); } } };
+    const ctx = {
+      mode: "print",
+      ui: { notify(message: string) { notifications.push(message); } },
+    };
 
     await command.handler("mode", ctx);
-    await command.handler("mode main", ctx);
-    await command.handler("mode sub", ctx);
-    await command.handler("workspace", ctx);
-    await command.handler("workspace worktree", ctx);
-    await command.handler("workspace", ctx);
-    await command.handler("invalid", ctx);
+    await command.handler("settings", ctx);
 
-    assert.deepEqual(entries, [
-      { type: "heishi:mode", data: { mode: "main" } },
-      { type: "heishi:mode", data: { mode: "sub" } },
-      { type: "heishi:workspace", data: { workspace: "worktree" } },
-    ]);
     assert.deepEqual(notifications, [
-      "Heishi default mode: main",
-      "Heishi default mode: main",
-      "Heishi default mode: sub",
-      "Heishi main-mode workspace: shared",
-      "Heishi main-mode workspace: worktree",
-      "Heishi main-mode workspace: worktree",
-      "Usage: /heishi model | /heishi mode [sub|main] | /heishi workspace [shared|worktree]",
+      "Usage: /heishi [settings]",
+      "Heishi settings require the interactive TUI",
     ]);
   });
 
-  it("lets explicit mode override the default and keeps main available with an empty sub pool", async () => {
+  it("keeps explicit main mode available with an empty sub pool", async () => {
     const tools: RegisteredTool[] = [];
-    const commands = new Map<string, RegisteredCommand>();
     const pi = {
       on() {},
-      appendEntry() {},
       registerTool(tool: RegisteredTool) { tools.push(tool); },
-      registerCommand(name: string, command: RegisteredCommand) { commands.set(name, command); },
+      registerCommand() {},
     } as unknown as ExtensionAPI;
     heishi(pi);
     const start = requireTool(tools, "subagent_start").execute;
@@ -377,18 +415,12 @@ describe("Heishi tool prompt metadata", () => {
       () => start("call-1", { mode: "main", task: "Inspect" }, undefined, undefined, ctx),
       /coordinator is not initialized/u,
     );
-    await commands.get("heishi")!.handler("mode main", ctx);
-    await commands.get("heishi")!.handler("workspace worktree", ctx);
     await assert.rejects(
-      () => start("call-2", { task: "Inspect" }, undefined, undefined, ctx),
-      /coordinator is not initialized/u,
-    );
-    await assert.rejects(
-      () => start("call-3", { mode: "sub", workspace: "worktree", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
+      () => start("call-2", { mode: "sub", workspace: "worktree", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
       /worktree workspace is available only in main mode/ui,
     );
     await assert.rejects(
-      () => start("call-4", { mode: "sub", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
+      () => start("call-3", { mode: "sub", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
       /delegation models are not configured/u,
     );
   });
@@ -438,53 +470,52 @@ describe("Heishi tool prompt metadata", () => {
     }
   });
 
-  it("restores session defaults and resets new and forked sessions", async () => {
-    const sessionHandlers: Array<(event: unknown, ctx: unknown) => Promise<void>> = [];
-    const commands = new Map<string, RegisteredCommand>();
-    const entries: Array<{ type: string; data: unknown }> = [];
-    const notifications: string[] = [];
-    const pi = {
-      on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
-        if (event === "session_start") sessionHandlers.push(handler);
-      },
-      registerTool() {},
-      appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
-      registerCommand(name: string, command: RegisteredCommand) { commands.set(name, command); },
-    } as unknown as ExtensionAPI;
-    heishi(pi);
-    const sessionStart = sessionHandlers[0];
-    assert.ok(sessionStart);
-    const branch = [
-      { type: "custom", customType: "heishi:mode", data: { mode: "main" } },
-      { type: "custom", customType: "heishi:workspace", data: { workspace: "worktree" } },
-    ];
-    const ctx = {
-      cwd: "/repo",
-      mode: "tui",
-      scopedModels: [],
-      isProjectTrusted: () => false,
-      modelRegistry: { getAvailable: () => [] },
-      sessionManager: { getBranch: () => branch },
-      ui: { notify(message: string) { notifications.push(message); } },
-    };
+  it("loads mode, workspace, and cleanup approval from trusted project settings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-index-"));
+    try {
+      const configDirectory = join(root, CONFIG_DIR_NAME);
+      await mkdir(configDirectory, { recursive: true });
+      await writeFile(join(configDirectory, "heishi.json"), JSON.stringify({
+        mode: "main",
+        workspace: "worktree",
+        models: [],
+        worktree: { cleanupApproval: "allow" },
+      }));
+      let sessionStart!: (event: unknown, ctx: unknown) => Promise<void>;
+      let beforeAgentStart!: (event: { systemPrompt: string }, ctx: unknown) => { systemPrompt: string };
+      const pi = {
+        on(event: string, handler: unknown) {
+          if (event === "session_start") sessionStart = handler as typeof sessionStart;
+          if (event === "before_agent_start") beforeAgentStart = handler as typeof beforeAgentStart;
+        },
+        registerTool() {},
+        appendEntry() {},
+        registerCommand() {},
+      } as unknown as ExtensionAPI;
+      heishi(pi);
+      const model = testModel("provider", "session-model");
+      const ctx = {
+        cwd: root,
+        scopedModels: [],
+        isProjectTrusted: () => true,
+        modelRegistry: { getAvailable: () => [] },
+        sessionManager: { getBranch: () => [] },
+        ui: { notify() {} },
+        model,
+        thinkingLevel: "high",
+      };
 
-    await sessionStart({ reason: "startup" }, ctx);
-    await commands.get("heishi")!.handler("workspace", ctx);
-    assert.equal(notifications.at(-1), "Heishi main-mode workspace: worktree");
-    await commands.get("heishi")!.handler("mode", ctx);
-    assert.deepEqual(entries.at(-1), { type: "heishi:mode", data: { mode: "sub" } });
-
-    for (const reason of ["new", "fork"]) {
-      entries.length = 0;
-      await sessionStart({ reason }, ctx);
-      assert.deepEqual(entries, [
-        { type: "heishi:mode", data: { mode: "sub" } },
-        { type: "heishi:workspace", data: { workspace: "shared" } },
-      ]);
+      await sessionStart({ reason: "startup" }, ctx);
+      const prompt = beforeAgentStart({ systemPrompt: "Base" }, ctx).systemPrompt;
+      assert.match(prompt, /default mode is `main`/u);
+      assert.match(prompt, /workspace default is `worktree`/u);
+      assert.match(prompt, /cleanup is currently allowed without confirmation/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("completes root and nested Heishi arguments with full replacement values", () => {
+  it("completes every supported Heishi argument", () => {
     const commands = new Map<string, RegisteredCommand>();
     const pi = {
       on() {},
@@ -495,12 +526,10 @@ describe("Heishi tool prompt metadata", () => {
     const complete = commands.get("heishi")?.getArgumentCompletions;
     assert.ok(complete);
 
-    assert.deepEqual(complete("" )?.map((item) => item.value), ["model", "mode", "workspace"]);
-    assert.deepEqual(complete("m")?.map((item) => item.value), ["model", "mode"]);
-    assert.deepEqual(complete("mode ")?.map((item) => item.value), ["mode sub", "mode main"]);
-    assert.deepEqual(complete("mode m")?.map((item) => item.value), ["mode main"]);
-    assert.deepEqual(complete("workspace ")?.map((item) => item.value), ["workspace shared", "workspace worktree"]);
-    assert.deepEqual(complete("workspace w")?.map((item) => item.value), ["workspace worktree"]);
+    assert.deepEqual(complete("")?.map((item) => item.value), ["settings"]);
+    assert.deepEqual(complete("s")?.map((item) => item.value), ["settings"]);
+    assert.equal(complete("settings "), null);
+    assert.equal(complete("mode"), null);
   });
 
   it("registers the bridge and normal Heishi tools together in main workers", async () => {

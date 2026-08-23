@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { reconcileRuns, restoreRunSnapshots, restoreSessionMode, restoreSessionWorkspace } from "./registry.js";
+import { reconcileRuns, restoreRunSnapshots } from "./registry.js";
 import type { RunRecord } from "./types.js";
 
 function makeRunRecord(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -290,15 +290,6 @@ describe("run registry restoration", () => {
     ]), []);
   });
 
-  it("restores the latest valid mode from the active branch", () => {
-    assert.equal(restoreSessionMode([
-      { type: "custom", customType: "heishi:mode", data: { mode: "main" } },
-      { type: "custom", customType: "heishi:mode", data: { mode: "invalid" } },
-      { type: "custom", customType: "heishi:mode", data: { mode: "sub" } },
-    ]), "sub");
-    assert.equal(restoreSessionMode([]), undefined);
-  });
-
   it("normalizes version-2 records to shared workspace", () => {
     const legacy = { ...makeRunRecord(), version: 2 } as Record<string, unknown>;
     delete legacy["workspace"];
@@ -309,15 +300,6 @@ describe("run registry restoration", () => {
 
     assert.equal(restored[0]?.version, 3);
     assert.equal(restored[0]?.workspace, "shared");
-  });
-
-  it("restores the latest valid workspace from the active branch", () => {
-    assert.equal(restoreSessionWorkspace([
-      { type: "custom", customType: "heishi:workspace", data: { workspace: "worktree" } },
-      { type: "custom", customType: "heishi:workspace", data: { workspace: "invalid" } },
-      { type: "custom", customType: "heishi:workspace", data: { workspace: "shared" } },
-    ]), "shared");
-    assert.equal(restoreSessionWorkspace([]), undefined);
   });
 
   it("marks restored open panes disconnected when tmux no longer has them", async () => {

@@ -8,22 +8,30 @@ import type { ScopedModel } from "@earendil-works/pi-coding-agent";
 import {
   allowedPairs,
   availableModelChoices,
+  loadConfig,
   loadEffectiveConfig,
+  resolveEffectiveConfig,
   saveConfig,
   validateMainOverrides,
-  type DelegationConfig,
+  type DelegationPair,
+  type HeishiConfig,
   type ModelChoice,
 } from "./model-config.js";
 
-const globalConfig: DelegationConfig = {
+const globalConfig: HeishiConfig = {
+  mode: "sub",
+  workspace: "shared",
   models: [{ model: "provider/global", thinking: "high" }],
+  worktree: { cleanupApproval: "ask" },
 };
-const projectConfig: DelegationConfig = {
+const projectConfig: HeishiConfig = {
+  mode: "main",
   models: [{ model: "provider/project", thinking: "medium" }],
+  worktree: { cleanupApproval: "allow" },
 };
 
 describe("Heishi delegation model configuration", () => {
-  it("uses a trusted project configuration as a full override", async () => {
+  it("overrides global settings field by field for trusted projects", async () => {
     const root = await mkdtemp(join(tmpdir(), "heishi-config-"));
     try {
       const globalPath = join(root, "global.json");
@@ -31,8 +39,18 @@ describe("Heishi delegation model configuration", () => {
       await saveConfig(globalPath, globalConfig);
       await saveConfig(projectPath, projectConfig);
 
-      assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, true)).config, projectConfig);
-      assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, false)).config, globalConfig);
+      assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, true)).config, {
+        mode: "main",
+        workspace: "shared",
+        models: projectConfig.models,
+        cleanupApproval: "allow",
+      });
+      assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, false)).config, {
+        mode: "sub",
+        workspace: "shared",
+        models: globalConfig.models,
+        cleanupApproval: "ask",
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -45,7 +63,39 @@ describe("Heishi delegation model configuration", () => {
       await saveConfig(globalPath, globalConfig);
 
       const loaded = await loadEffectiveConfig(globalPath, join(root, "missing.json"), true);
-      assert.deepEqual(loaded.config, globalConfig);
+      assert.deepEqual(loaded.config, {
+        mode: "sub",
+        workspace: "shared",
+        models: globalConfig.models,
+        cleanupApproval: "ask",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("inherits missing project fields and defaults missing global fields", () => {
+    assert.deepEqual(resolveEffectiveConfig({}, { workspace: "worktree" }), {
+      mode: "sub",
+      workspace: "worktree",
+      models: [],
+      cleanupApproval: "ask",
+    });
+    assert.deepEqual(resolveEffectiveConfig(globalConfig, { workspace: "worktree" }), {
+      mode: "sub",
+      workspace: "worktree",
+      models: globalConfig.models,
+      cleanupApproval: "ask",
+    });
+  });
+
+  it("loads and saves partial scoped configuration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-config-"));
+    try {
+      const path = join(root, "heishi.json");
+      const partial: HeishiConfig = { workspace: "worktree", worktree: { cleanupApproval: "allow" } };
+      await saveConfig(path, partial);
+      assert.deepEqual((await loadConfig(path)).config, partial);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -53,7 +103,7 @@ describe("Heishi delegation model configuration", () => {
 
   it("only permits configured pairs that remain available and supported", () => {
     const choices: ModelChoice[] = [{ model: model("provider", "allowed"), levels: ["off", "high"] }];
-    const config: DelegationConfig = {
+    const config: { models: DelegationPair[] } = {
       models: [
         { model: "provider/allowed", thinking: "high" },
         { model: "provider/allowed", thinking: "max" },

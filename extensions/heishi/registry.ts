@@ -1,11 +1,9 @@
 import { isAbsolute } from "node:path";
 import { THINKING_LEVELS, type ThinkingLevel } from "./tmux.js";
-import type { RunRecord, RunStatus, SubagentReport, WorkerMode, WorkspaceKind, WorktreeRecord } from "./types.js";
+import type { RunRecord, RunStatus, SubagentReport, WorkspaceKind, WorktreeRecord } from "./types.js";
 import { isSafeRelativeCwd } from "./workspace.js";
 
 export const RUN_ENTRY_TYPE = "heishi:subagent-run";
-export const MODE_ENTRY_TYPE = "heishi:mode";
-export const WORKSPACE_ENTRY_TYPE = "heishi:workspace";
 
 const OPTIONAL_STRING_FIELDS = [
   "tmuxTarget", "tmuxWindowId", "tmuxSessionId", "workerSessionId", "workerSessionFile",
@@ -23,34 +21,6 @@ export function restoreRunSnapshots(entries: readonly unknown[]): RunRecord[] {
     if (run) runs.set(run.runId, run);
   }
   return [...runs.values()];
-}
-
-export function restoreSessionMode(entries: readonly unknown[]): WorkerMode | undefined {
-  let mode: WorkerMode | undefined;
-  for (const value of entries) {
-    if (typeof value !== "object" || value === null) continue;
-    const entry = value as Record<string, unknown>;
-    if (entry["type"] !== "custom" || entry["customType"] !== MODE_ENTRY_TYPE) continue;
-    const data = entry["data"];
-    if (typeof data !== "object" || data === null) continue;
-    const candidate = (data as Record<string, unknown>)["mode"];
-    if (candidate === "sub" || candidate === "main") mode = candidate;
-  }
-  return mode;
-}
-
-export function restoreSessionWorkspace(entries: readonly unknown[]): WorkspaceKind | undefined {
-  let workspace: WorkspaceKind | undefined;
-  for (const value of entries) {
-    if (typeof value !== "object" || value === null) continue;
-    const entry = value as Record<string, unknown>;
-    if (entry["type"] !== "custom" || entry["customType"] !== WORKSPACE_ENTRY_TYPE) continue;
-    const data = entry["data"];
-    if (typeof data !== "object" || data === null) continue;
-    const candidate = (data as Record<string, unknown>)["workspace"];
-    if (candidate === "shared" || candidate === "worktree") workspace = candidate;
-  }
-  return workspace;
 }
 
 export async function reconcileRuns(

@@ -5,14 +5,29 @@ import type { Model } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ScopedModel } from "@earendil-works/pi-coding-agent";
 import { THINKING_LEVELS, type ThinkingLevel } from "./tmux.js";
+import type { WorkerMode, WorkspaceKind } from "./types.js";
 
 export interface DelegationPair {
   model: string;
   thinking: ThinkingLevel;
 }
 
-export interface DelegationConfig {
+export type CleanupApproval = "ask" | "allow";
+
+export interface HeishiConfig {
+  mode?: WorkerMode;
+  workspace?: WorkspaceKind;
+  models?: DelegationPair[];
+  worktree?: {
+    cleanupApproval?: CleanupApproval;
+  };
+}
+
+export interface EffectiveHeishiConfig {
+  mode: WorkerMode;
+  workspace: WorkspaceKind;
   models: DelegationPair[];
+  cleanupApproval: CleanupApproval;
 }
 
 export interface ModelChoice {
@@ -21,22 +36,33 @@ export interface ModelChoice {
 }
 
 export interface LoadedConfig {
-  config: DelegationConfig;
+  config: HeishiConfig;
   exists: boolean;
   error?: string;
 }
 
+export interface LoadedEffectiveConfig {
+  config: EffectiveHeishiConfig;
+  error?: string;
+}
+
 const THINKING_LEVEL_SET = new Set<ThinkingLevel>(THINKING_LEVELS);
+const DEFAULT_CONFIG: EffectiveHeishiConfig = {
+  mode: "sub",
+  workspace: "shared",
+  models: [],
+  cleanupApproval: "ask",
+};
 
 export async function loadConfig(path: string): Promise<LoadedConfig> {
-  if (!existsSync(path)) return { config: { models: [] }, exists: false };
+  if (!existsSync(path)) return { config: {}, exists: false };
 
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
     return { config: parseConfig(parsed), exists: true };
   } catch (error) {
     return {
-      config: { models: [] },
+      config: {},
       exists: true,
       error: `Failed to load ${path}: ${error instanceof Error ? error.message : String(error)}`,
     };
@@ -47,15 +73,32 @@ export async function loadEffectiveConfig(
   globalPath: string,
   projectPath: string,
   projectTrusted: boolean,
-): Promise<LoadedConfig> {
-  if (projectTrusted) {
-    const project = await loadConfig(projectPath);
-    if (project.exists) return project;
-  }
-  return loadConfig(globalPath);
+): Promise<LoadedEffectiveConfig> {
+  const global = await loadConfig(globalPath);
+  const project = projectTrusted ? await loadConfig(projectPath) : undefined;
+  const errors = [global.error, project?.error].filter((error): error is string => error !== undefined);
+  const loaded: LoadedEffectiveConfig = {
+    config: resolveEffectiveConfig(global.config, project?.config),
+  };
+  if (errors.length > 0) loaded.error = errors.join("\n");
+  return loaded;
 }
 
-export async function saveConfig(path: string, config: DelegationConfig): Promise<void> {
+export function resolveEffectiveConfig(
+  global: HeishiConfig,
+  project?: HeishiConfig,
+): EffectiveHeishiConfig {
+  return {
+    mode: project?.mode ?? global.mode ?? DEFAULT_CONFIG.mode,
+    workspace: project?.workspace ?? global.workspace ?? DEFAULT_CONFIG.workspace,
+    models: [...(project?.models ?? global.models ?? DEFAULT_CONFIG.models)],
+    cleanupApproval: project?.worktree?.cleanupApproval
+      ?? global.worktree?.cleanupApproval
+      ?? DEFAULT_CONFIG.cleanupApproval,
+  };
+}
+
+export async function saveConfig(path: string, config: HeishiConfig): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
@@ -83,7 +126,7 @@ export function availableModelChoices(
     .sort((left, right) => modelReference(left.model).localeCompare(modelReference(right.model)));
 }
 
-export function allowedPairs(config: DelegationConfig, choices: readonly ModelChoice[]): DelegationPair[] {
+export function allowedPairs(config: Pick<EffectiveHeishiConfig, "models">, choices: readonly ModelChoice[]): DelegationPair[] {
   const valid = new Map(choices.map((choice) => [modelReference(choice.model), new Set(choice.levels)]));
   return config.models.filter((pair) => valid.get(pair.model)?.has(pair.thinking) === true);
 }
@@ -107,14 +150,38 @@ export function validateMainOverrides(
   }
 }
 
-function parseConfig(value: unknown): DelegationConfig {
-  if (!isRecord(value) || !Array.isArray(value["models"])) {
-    throw new Error("expected an object with a models array");
+function parseConfig(value: unknown): HeishiConfig {
+  if (!isRecord(value)) throw new Error("expected an object");
+
+  const config: HeishiConfig = {};
+  const mode = value["mode"];
+  if (mode !== undefined) {
+    if (mode !== "sub" && mode !== "main") throw new Error("mode must be sub or main");
+    config.mode = mode;
   }
+
+  const workspace = value["workspace"];
+  if (workspace !== undefined) {
+    if (workspace !== "shared" && workspace !== "worktree") {
+      throw new Error("workspace must be shared or worktree");
+    }
+    config.workspace = workspace;
+  }
+
+  const modelEntries = value["models"];
+  if (modelEntries !== undefined) config.models = parseModels(modelEntries);
+
+  const worktree = value["worktree"];
+  if (worktree !== undefined) config.worktree = parseWorktreeConfig(worktree);
+  return config;
+}
+
+function parseModels(value: unknown): DelegationPair[] {
+  if (!Array.isArray(value)) throw new Error("models must be an array");
 
   const models: DelegationPair[] = [];
   const seen = new Set<string>();
-  for (const entry of value["models"]) {
+  for (const entry of value) {
     if (!isRecord(entry) || typeof entry["model"] !== "string" || !isThinkingLevel(entry["thinking"])) {
       throw new Error("every model entry must contain a model string and valid thinking level");
     }
@@ -125,7 +192,17 @@ function parseConfig(value: unknown): DelegationConfig {
       models.push(pair);
     }
   }
-  return { models };
+  return models;
+}
+
+function parseWorktreeConfig(value: unknown): NonNullable<HeishiConfig["worktree"]> {
+  if (!isRecord(value)) throw new Error("worktree must be an object");
+  const cleanupApproval = value["cleanupApproval"];
+  if (cleanupApproval === undefined) return {};
+  if (cleanupApproval !== "ask" && cleanupApproval !== "allow") {
+    throw new Error("worktree.cleanupApproval must be ask or allow");
+  }
+  return { cleanupApproval };
 }
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {

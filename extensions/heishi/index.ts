@@ -10,33 +10,28 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { WorktreeCleanupApproval } from "./cleanup.js";
 import { RunCoordinator } from "./coordinator.js";
 import { IpcHub } from "./ipc.js";
 import {
   allowedPairs,
   availableModelChoices,
-  loadConfig,
   loadEffectiveConfig,
   modelReference,
-  saveConfig,
   validateMainOverrides,
-  type DelegationConfig,
   type DelegationPair,
+  type EffectiveHeishiConfig,
 } from "./model-config.js";
-import { pickDelegationPairs } from "./model-picker.js";
 import { showSubagentOverlay } from "./overlay.js";
 import {
-  MODE_ENTRY_TYPE,
   reconcileRuns,
   restoreRunSnapshots,
-  restoreSessionMode,
-  restoreSessionWorkspace,
   RUN_ENTRY_TYPE,
-  WORKSPACE_ENTRY_TYPE,
 } from "./registry.js";
 import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
 import { THINKING_LEVELS, Tmux } from "./tmux.js";
-import type { ControlInput, RunRecord, RunResult, StartInput, WaitResult, WorkerMode, WorkspaceKind } from "./types.js";
+import { showHeishiSettings } from "./settings.js";
+import type { ControlInput, RunResult, StartInput, WaitResult } from "./types.js";
 import { registerWorkerBridge, resolveWorkerMode } from "./worker.js";
 import { GitWorktrees } from "./worktree.js";
 import { resolveWorkspace } from "./workspace.js";
@@ -79,12 +74,16 @@ export default function heishi(pi: ExtensionAPI): void {
   const tmux = new Tmux();
   const ipc = new IpcHub();
   const worktrees = new GitWorktrees(getAgentDir());
+  const worktreeCleanup = new WorktreeCleanupApproval();
   const extensionPath = fileURLToPath(import.meta.url);
   let coordinator: RunCoordinator | undefined;
-  let delegationConfig: DelegationConfig = { models: [] };
-  let delegationConfigError: string | undefined;
-  let defaultMode: WorkerMode = "sub";
-  let defaultWorkspace: WorkspaceKind = "shared";
+  let config: EffectiveHeishiConfig = {
+    mode: "sub",
+    workspace: "shared",
+    models: [],
+    cleanupApproval: "ask",
+  };
+  let configError: string | undefined;
 
   const createCoordinator = (ctx: ExtensionContext): RunCoordinator => new RunCoordinator({
     cwd: ctx.cwd,
@@ -102,23 +101,16 @@ export default function heishi(pi: ExtensionAPI): void {
     return coordinator;
   };
 
-  pi.on("session_start", async (event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     if (coordinator) await coordinator.shutdown();
     coordinator = createCoordinator(ctx);
-    const startsNewSession = event.reason === "new" || event.reason === "fork";
-    defaultMode = startsNewSession ? "sub" : restoreSessionMode(ctx.sessionManager.getBranch()) ?? "sub";
-    defaultWorkspace = startsNewSession ? "shared" : restoreSessionWorkspace(ctx.sessionManager.getBranch()) ?? "shared";
-    if (startsNewSession) {
-      pi.appendEntry(MODE_ENTRY_TYPE, { mode: "sub" });
-      pi.appendEntry(WORKSPACE_ENTRY_TYPE, { workspace: "shared" });
-    }
     const loaded = await loadEffectiveConfig(
       join(getAgentDir(), "heishi.json"),
       join(ctx.cwd, CONFIG_DIR_NAME, "heishi.json"),
       ctx.isProjectTrusted(),
     );
-    delegationConfig = loaded.config;
-    delegationConfigError = loaded.error;
+    config = loaded.config;
+    configError = loaded.error;
     if (loaded.error) ctx.ui.notify(loaded.error, "warning");
 
     const restored = restoreRunSnapshots(ctx.sessionManager.getBranch());
@@ -145,13 +137,13 @@ export default function heishi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
       ...DELEGATION_BRIEF_GUIDELINES,
-      "The optional `mode` parameter overrides the current Heishi session default for that run.",
+      "The optional `mode` parameter overrides the effective Heishi configuration for that run.",
       ...TASK_MODE_GUIDELINES,
       "Sub mode uses the constrained, fast resource profile and requires an explicit model/thinking pair from the Heishi delegation pool.",
       "Main mode loads normal Pi extensions, skills, tools, and prompt templates.",
       ...MAIN_MODEL_GUIDELINES,
       "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission defaults to `session` in sub mode and `window` in main mode.",
-      "The optional `workspace` parameter is independent of tmux placement. Main mode uses the current workspace default when it is omitted; sub mode always uses the shared checkout. An explicit `worktree` is valid only in main mode and isolates repository writes on a retained branch.",
+      "The optional `workspace` parameter is independent of tmux placement. Main mode uses the effective Heishi workspace when it is omitted; sub mode always uses the shared checkout. An explicit `worktree` is valid only in main mode and isolates repository writes on a retained branch.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent shared-workspace writers must edit non-overlapping files. Use main-mode worktree workspaces when writers need isolated checkouts.",
       "After every successful `subagent_start`, use `subagent_control` first only when live interaction is needed, then use `subagent_wait` for every started run; otherwise use `subagent_wait` immediately. Do not inspect, implement, or answer the user until all waits return.",
@@ -159,7 +151,7 @@ export default function heishi(pi: ExtensionAPI): void {
     parameters: Type.Object({
       mode: Type.Optional(Type.Union(
         [Type.Literal("sub"), Type.Literal("main")],
-        { description: "Optional worker mode. Pass sub for read-only work or main for repository writes; omission uses the current session default" },
+        { description: "Optional worker mode. Pass sub for read-only work or main for repository writes; omission uses the effective Heishi configuration" },
       )),
       task: Type.String({ description: "Self-contained delegated brief with objective, background and decisions, scope and exclusions, relevant paths or symbols, constraints and assumptions, expected deliverable, and verification; the worker receives no parent conversation" }),
       alias: Type.Optional(Type.String({ description: "Optional display alias; if omitted, a Greek mythological name is chosen" })),
@@ -171,16 +163,16 @@ export default function heishi(pi: ExtensionAPI): void {
       )),
       workspace: Type.Optional(Type.Union(
         [Type.Literal("shared"), Type.Literal("worktree")],
-        { description: "Optional repository workspace. Main mode uses the current session default when omitted; sub mode always uses shared and rejects an explicit worktree" },
+        { description: "Optional repository workspace. Main mode uses the effective Heishi configuration when omitted; sub mode always uses shared and rejects an explicit worktree" },
       )),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const mode = params.mode ?? defaultMode;
-      const workspace = resolveWorkspace(mode, params.workspace, defaultWorkspace);
+      const mode = params.mode ?? config.mode;
+      const workspace = resolveWorkspace(mode, params.workspace, config.workspace);
       if (mode === "sub") {
         const pairs = effectivePairs(ctx);
         if (pairs.length === 0) {
-          throw new Error(delegationConfigError ?? "Heishi delegation models are not configured; use /heishi model");
+          throw new Error(configError ?? "Heishi delegation models are not configured; use /heishi settings");
         }
         if (params.model === undefined || params.thinking === undefined) {
           throw new Error("Sub mode requires an explicit model and thinking level");
@@ -238,7 +230,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Use `steer` only while a subagent is actively running and connected; do not use `steer` after `subagent_wait`. Resume it and use `prompt` or `follow_up` instead.",
       "After `prompt`, `follow_up`, or `steer`, use `subagent_wait` before the main agent inspects, implements, or answers with the delegated result.",
       "Do not assign write work to a sub-mode run through `prompt`, `follow_up`, or `steer`; start a main-mode run instead.",
-      "`subagent_control` action `cleanup` requires interactive TUI confirmation that names the run and worktree path. Non-interactive cleanup is rejected. Cleanup refuses local files, removes only the worktree, and retains its branch.",
+      "`subagent_control` action `cleanup` follows the configured worktree approval policy. Ask mode queues interactive confirmations that name the run and worktree path; allow mode skips the prompt. Cleanup always refuses modified, untracked, or ignored files, removes only the worktree, and retains its branch.",
     ],
     parameters: Type.Object({
       runId: Type.String({ description: "Full authoritative run UUID returned by subagent_start" }),
@@ -256,7 +248,7 @@ export default function heishi(pi: ExtensionAPI): void {
       const activeCoordinator = requireCoordinator();
       if (params.action === "cleanup") {
         return controlToolResult(
-          await cleanupWithConfirmation(activeCoordinator, params.runId, ctx),
+          await worktreeCleanup.execute(activeCoordinator, params.runId, config.cleanupApproval, ctx, _signal),
           params.action,
         );
       }
@@ -330,10 +322,10 @@ export default function heishi(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event, ctx) => {
     const pairs = effectivePairs(ctx);
     const modeGuidance = [
-      `The current Heishi default mode is \`${defaultMode}\`.`,
-      "Omitting subagent_start.mode uses this default. An explicit mode overrides it for that run.",
-      `The current Heishi main-mode workspace default is \`${defaultWorkspace}\`.`,
-      "Omitting subagent_start.workspace uses this default in main mode. Sub mode always uses the shared checkout and rejects an explicit worktree.",
+      `The current Heishi default mode is \`${config.mode}\`.`,
+      "Omitting subagent_start.mode uses this effective configured value. An explicit mode overrides it for that run.",
+      `The current Heishi main-mode workspace default is \`${config.workspace}\`.`,
+      "Omitting subagent_start.workspace uses this effective configured value in main mode. Sub mode always uses the shared checkout and rejects an explicit worktree.",
     ].join("\n");
     const poolGuidance = pairs.length === 0
       ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode remains available when the user explicitly requests an authenticated model."
@@ -345,10 +337,13 @@ export default function heishi(pi: ExtensionAPI): void {
     const taskModeGuidance = TASK_MODE_GUIDELINES.join("\n");
     const delegationBriefGuidance = DELEGATION_BRIEF_GUIDELINES.join("\n");
     const mainModelGuidance = MAIN_MODEL_GUIDELINES.join("\n");
+    const cleanupGuidance = config.cleanupApproval === "ask"
+      ? "Worktree cleanup currently requires interactive confirmation."
+      : "Worktree cleanup is currently allowed without confirmation, but all worktree safety checks still apply.";
     const sessionModelGuidance = ctx.model && ctx.thinkingLevel
       ? `The parent session's exact active model/thinking pair is ${modelReference(ctx.model)} / ${ctx.thinkingLevel}.`
       : "The parent session's exact active model/thinking pair is unavailable; use the Heishi delegation pool as the final fallback for main mode.";
-    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${sessionModelGuidance}\n${poolGuidance}` };
+    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${sessionModelGuidance}\n${cleanupGuidance}\n${poolGuidance}` };
   });
 
   pi.registerCommand("heishi", {
@@ -356,60 +351,23 @@ export default function heishi(pi: ExtensionAPI): void {
     getArgumentCompletions: heishiArgumentCompletions,
     handler: async (args, ctx) => {
       const command = args.trim();
-      if (command === "workspace" || command === "workspace shared" || command === "workspace worktree") {
-        if (command !== "workspace") {
-          const requested = command.slice("workspace ".length) as WorkspaceKind;
-          if (requested !== defaultWorkspace) {
-            defaultWorkspace = requested;
-            pi.appendEntry(WORKSPACE_ENTRY_TYPE, { workspace: defaultWorkspace });
-          }
-        }
-        ctx.ui.notify(`Heishi main-mode workspace: ${defaultWorkspace}`, "info");
-        return;
-      }
-      if (command === "mode" || command === "mode sub" || command === "mode main") {
-        const requested = command === "mode" ? (defaultMode === "sub" ? "main" : "sub") : command.slice(5) as WorkerMode;
-        if (requested !== defaultMode) {
-          defaultMode = requested;
-          pi.appendEntry(MODE_ENTRY_TYPE, { mode: defaultMode });
-        }
-        ctx.ui.notify(`Heishi default mode: ${defaultMode}`, "info");
-        return;
-      }
-      if (command !== "model") {
-        ctx.ui.notify("Usage: /heishi model | /heishi mode [sub|main] | /heishi workspace [shared|worktree]", "info");
+      if (command !== "" && command !== "settings") {
+        ctx.ui.notify("Usage: /heishi [settings]", "info");
         return;
       }
       if (ctx.mode !== "tui") {
-        ctx.ui.notify("/heishi model requires the interactive TUI", "warning");
+        ctx.ui.notify("Heishi settings require the interactive TUI", "warning");
         return;
       }
-
-      await ctx.modelRegistry.refresh();
-      const scopes = ctx.isProjectTrusted() ? ["Global", "Current project"] : ["Global"];
-      const scope = await ctx.ui.select("Save Heishi delegation models to", scopes);
-      if (!scope) return;
 
       const globalPath = join(getAgentDir(), "heishi.json");
       const projectPath = join(ctx.cwd, CONFIG_DIR_NAME, "heishi.json");
-      const path = scope === "Current project" ? projectPath : globalPath;
-      let initial = await loadConfig(path);
-      if (scope === "Current project" && !initial.exists) initial = await loadConfig(globalPath);
-      if (initial.error) ctx.ui.notify(initial.error, "warning");
-
-      const choices = availableModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels);
-      if (choices.length === 0) {
-        ctx.ui.notify("No authenticated models are available", "warning");
-        return;
+      if (await showHeishiSettings(ctx, { global: globalPath, project: projectPath })) {
+        const loaded = await loadEffectiveConfig(globalPath, projectPath, ctx.isProjectTrusted());
+        config = loaded.config;
+        configError = loaded.error;
+        if (loaded.error) ctx.ui.notify(loaded.error, "warning");
       }
-      const selected = await pickDelegationPairs(ctx, choices, initial.config.models);
-      if (!selected) return;
-
-      await saveConfig(path, { models: selected });
-      const loaded = await loadEffectiveConfig(globalPath, projectPath, ctx.isProjectTrusted());
-      delegationConfig = loaded.config;
-      delegationConfigError = loaded.error;
-      ctx.ui.notify(`Saved ${selected.length} Heishi delegation pair${selected.length === 1 ? "" : "s"} to ${path}`, "info");
     },
   });
 
@@ -428,66 +386,14 @@ export default function heishi(pi: ExtensionAPI): void {
 
   function effectivePairs(ctx: ExtensionContext): DelegationPair[] {
     return allowedPairs(
-      delegationConfig,
+      config,
       availableModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels),
     );
   }
 }
 
 function heishiArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {
-  if (prefix.startsWith("workspace ")) {
-    const nestedPrefix = prefix.slice("workspace ".length);
-    const items = [
-      { value: "workspace shared", label: "shared" },
-      { value: "workspace worktree", label: "worktree" },
-    ].filter((item) => item.label.startsWith(nestedPrefix));
-    return items.length > 0 ? items : null;
-  }
-  if (prefix.startsWith("mode ")) {
-    const nestedPrefix = prefix.slice("mode ".length);
-    const items = [
-      { value: "mode sub", label: "sub" },
-      { value: "mode main", label: "main" },
-    ].filter((item) => item.label.startsWith(nestedPrefix));
-    return items.length > 0 ? items : null;
-  }
-  if (prefix.includes(" ")) return null;
-  const items = [
-    { value: "model", label: "model" },
-    { value: "mode", label: "mode" },
-    { value: "workspace", label: "workspace" },
-  ].filter((item) => item.value.startsWith(prefix));
-  return items.length > 0 ? items : null;
-}
-
-interface CleanupCoordinator {
-  validateCleanup(runId: string): Promise<RunRecord>;
-  control(input: ControlInput): Promise<RunResult>;
-}
-
-interface CleanupContext {
-  mode: ExtensionContext["mode"];
-  ui: Pick<ExtensionContext["ui"], "confirm">;
-}
-
-export async function cleanupWithConfirmation(
-  coordinator: CleanupCoordinator,
-  runId: string,
-  ctx: CleanupContext,
-): Promise<RunResult> {
-  if (ctx.mode !== "tui") {
-    throw new Error("Worktree cleanup requires confirmation in the interactive TUI");
-  }
-  const run = await coordinator.validateCleanup(runId);
-  if (!run.worktree) throw new Error("Worktree run has no prepared workspace to clean up");
-  const confirmed = await ctx.ui.confirm(
-    `Remove ${run.alias}'s worktree?`,
-    `Run: ${run.alias}\nPath: ${run.worktree.path}\nBranch ${run.worktree.branch} will be retained.`,
-  );
-  if (!confirmed) {
-    throw new Error(`Worktree cleanup cancelled for ${run.alias}: ${run.worktree.path}`);
-  }
-  return coordinator.control({ runId, action: "cleanup" });
+  return "settings".startsWith(prefix) ? [{ value: "settings", label: "settings" }] : null;
 }
 
 interface RenderableResult {
