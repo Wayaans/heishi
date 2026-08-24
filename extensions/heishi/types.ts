@@ -1,4 +1,4 @@
-import type { Placement, ThinkingLevel } from "./tmux.js";
+import type { HostTarget, Placement, TerminalHostKind, ThinkingLevel } from "./terminal-host.js";
 
 export type WorkerMode = "sub" | "main";
 export type WorkspaceKind = "shared" | "worktree";
@@ -47,7 +47,7 @@ export interface RemovedWorktreeRecord extends WorktreeRecordBase {
 export type WorktreeRecord = PresentWorktreeRecord | RemovedWorktreeRecord;
 
 export interface RunRecord {
-  version: 3;
+  version: 4;
   mode: WorkerMode;
   workspace: WorkspaceKind;
   worktree?: WorktreeRecord;
@@ -60,6 +60,7 @@ export interface RunRecord {
   placement: Placement;
   status: RunStatus;
   paneState: PaneState;
+  hostTarget?: HostTarget;
   tmuxTarget?: string;
   tmuxWindowId?: string;
   tmuxSessionId?: string;
@@ -95,6 +96,8 @@ export interface RunResult {
   runId: string;
   alias: string;
   status: RunStatus;
+  host?: TerminalHostKind;
+  hostTarget?: HostTarget;
   tmuxTarget?: string;
   tmuxWindowId?: string;
   tmuxSessionId?: string;
@@ -133,6 +136,10 @@ export function resultFromRun(run: RunRecord): RunResult {
   }
   if (run.model !== undefined) result.model = run.model;
   if (run.thinking !== undefined) result.thinking = run.thinking;
+  if (run.hostTarget !== undefined) {
+    result.host = run.hostTarget.host;
+    result.hostTarget = structuredClone(run.hostTarget);
+  }
   if (run.tmuxTarget !== undefined) result.tmuxTarget = run.tmuxTarget;
   if (run.tmuxWindowId !== undefined) result.tmuxWindowId = run.tmuxWindowId;
   if (run.tmuxSessionId !== undefined) result.tmuxSessionId = run.tmuxSessionId;

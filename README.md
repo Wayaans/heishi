@@ -1,13 +1,13 @@
 # Heishi
 
-Persistent, interactive subagents for [Pi](https://github.com/earendil-works/pi-mono), powered by tmux.
+Persistent, interactive subagents for [Pi](https://github.com/earendil-works/pi-mono), running in tmux or cmux.
 
 Heishi lets Pi delegate work to concurrent agent sessions, steer them while they run, and resume completed sessions without losing context.
 
 ## Requirements
 
 - [Pi](https://github.com/earendil-works/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [tmux](https://github.com/tmux/tmux) or [cmux](https://cmux.com)
 - At least one authenticated Pi model
 
 ## Install
@@ -22,13 +22,13 @@ Restart Pi, then open Heishi settings:
 /heishi
 ```
 
-Choose Global or Current project first, then configure the default mode, main-mode workspace, delegation models, and worktree cleanup approval. Trusted project settings override individual global values; settings without a project override continue to inherit their global value. `/heishi settings` opens the same interface.
+Choose Global or Current project first, then configure the default mode, main-mode workspace, terminal host, delegation models, and worktree cleanup approval. Trusted project settings override individual global values. Settings without a project override inherit their global value. `/heishi settings` opens the same interface.
 
 ## Usage
 
 Heishi gives Pi three tools:
 
-- `subagent_start` — start a managed worker in tmux
+- `subagent_start` starts a worker in the configured terminal host
 - `subagent_control` — prompt, steer, follow up, abort, resume, or clean up a worker workspace
 - `subagent_wait` — wait for a worker to finish and return its report
 
@@ -58,9 +58,23 @@ Workers use the shared checkout by default. Main-mode workers can instead use an
 
 Heishi requires the source checkout to be clean, including untracked files. It creates branch `heishi/<run-id>` from the source checkout's exact HEAD and places the worktree at `<agent-dir>/heishi/worktrees/<repo-name>-<repo-id>/<run-id>`. Ignored files are not copied. The worktree and branch remain after the worker settles, waits, shuts down, or fails after launch. If startup fails before launch, Heishi removes a safely identified worktree registration and path when possible, but retains the generated branch and internal lease for manual recovery. Persisted worktree metadata records whether the worktree is present or removed, and the startup error warns that both refs were retained. Heishi never merges branches or deletes refs.
 
-After reviewing or integrating the work yourself, use `subagent_control` action `cleanup`. The default `ask` approval policy displays a confirmation naming the run and exact worktree path. Parallel confirmations are queued and shown one at a time. The `allow` policy is standing authorization to clean without a prompt, including in non-interactive mode. Configure this policy globally or for a trusted project through `/heishi`. Both policies use ordinary `git worktree remove` only when a settled worktree contains no modified, untracked, or ignored files. Cleanup also requires a verified closed pane and retains the branch and internal lease. Resume recreates an explicitly removed worktree from that retained branch at the same path. Heishi refuses missing or inconsistent workspace state instead of pruning or overwriting it. No Heishi tool deletes refs.
+After reviewing or integrating the work yourself, use `subagent_control` action `cleanup`. The default `ask` approval policy displays a confirmation naming the run and exact worktree path. Parallel confirmations are queued and shown one at a time. The `allow` policy is standing authorization to clean without a prompt, including in non-interactive mode. Configure this policy globally or for a trusted project through `/heishi`. Both policies use ordinary `git worktree remove` only when a settled worktree contains no modified, untracked, or ignored files. Cleanup also requires a verified closed terminal target and retains the branch and internal lease. Resume recreates an explicitly removed worktree from that retained branch at the same path. Heishi refuses missing or inconsistent workspace state instead of pruning or overwriting it. No Heishi tool deletes refs.
 
-By default, sub workers open in a detached window in the `heishi-subagents` tmux session, while main workers open in a detached window in the current tmux session. An explicit placement can open either mode in the background session or in the current tmux session as a pane or detached window.
+### Terminal hosts
+
+Set `terminalHost` to `auto`, `tmux`, or `cmux` through `/heishi`. The built-in default is `auto`. Explicit values validate only the selected host. Auto mode checks the current tmux and cmux caller contexts for each start and resume. If both hosts are valid, Heishi compares the controlling terminal with the tmux pane. It refuses an ambiguous result and asks you to select a host instead of launching into the wrong terminal.
+
+Active workers keep their recorded host even if the setting changes. A settled worker may resume in another host after its previous target is verified closed. Heishi stores stable cmux UUIDs and the cmux socket path, not topology-dependent short references.
+
+The public placements keep the same names but map to each host differently:
+
+| Placement | tmux | cmux |
+| --- | --- | --- |
+| `pane` | Detached split pane | Split pane in the caller workspace |
+| `window` | Detached window in the current session | Surface tab in the caller workspace |
+| `session` | Detached window in `heishi-subagents` | Surface tab in the shared `Heishi subagents` workspace |
+
+Sub workers default to `session`, so cmux groups them as surface tabs in one dedicated workspace. Heishi closes that workspace after its last managed surface closes. Main workers default to `window`, so cmux opens them as surface tabs in the caller workspace. Cmux workers launch without focus changes. Heishi also disables cmux's Pi lifecycle hooks inside managed workers so Heishi remains responsible for stop, resume, and cleanup.
 
 Shared-workspace subagents use the current checkout. Run concurrent shared writers only on separate files; use main-mode worktree workspaces for isolated checkouts.
 
@@ -78,4 +92,11 @@ cd heishi
 bun install
 bun run check
 bun test
+```
+
+Run opt-in adapter smoke tests from the matching host:
+
+```sh
+HEISHI_REAL_CMUX_SMOKE=1 bun test extensions/heishi/terminal-host.smoke.test.ts
+HEISHI_REAL_TMUX_SMOKE=1 bun test extensions/heishi/terminal-host.smoke.test.ts
 ```

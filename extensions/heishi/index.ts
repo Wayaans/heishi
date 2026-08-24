@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CONFIG_DIR_NAME,
@@ -11,6 +12,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { WorktreeCleanupApproval } from "./cleanup.js";
+import { Cmux } from "./cmux.js";
 import { RunCoordinator } from "./coordinator.js";
 import { IpcHub } from "./ipc.js";
 import {
@@ -29,7 +31,9 @@ import {
   RUN_ENTRY_TYPE,
 } from "./registry.js";
 import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
-import { THINKING_LEVELS, Tmux } from "./tmux.js";
+import { TerminalHostResolver } from "./terminal-host-resolver.js";
+import { THINKING_LEVELS } from "./terminal-host.js";
+import { Tmux, TmuxHost } from "./tmux.js";
 import { showHeishiSettings } from "./settings.js";
 import type { ControlInput, RunResult, StartInput, WaitResult } from "./types.js";
 import { registerWorkerBridge, resolveWorkerMode } from "./worker.js";
@@ -72,6 +76,7 @@ export default function heishi(pi: ExtensionAPI): void {
   }
 
   const tmux = new Tmux();
+  const hosts = new TerminalHostResolver([new TmuxHost(tmux), new Cmux()]);
   const ipc = new IpcHub();
   const worktrees = new GitWorktrees(getAgentDir());
   const worktreeCleanup = new WorktreeCleanupApproval();
@@ -80,6 +85,7 @@ export default function heishi(pi: ExtensionAPI): void {
   let config: EffectiveHeishiConfig = {
     mode: "sub",
     workspace: "shared",
+    terminalHost: "auto",
     models: [],
     cleanupApproval: "ask",
   };
@@ -88,8 +94,9 @@ export default function heishi(pi: ExtensionAPI): void {
   const createCoordinator = (ctx: ExtensionContext): RunCoordinator => new RunCoordinator({
     cwd: ctx.cwd,
     extensionPath,
-    piPath: "pi",
-    tmux,
+    piPath: currentPiInvocation(),
+    hosts,
+    hostPreference: () => config.terminalHost,
     ipc,
     worktrees,
     persist: (record) => pi.appendEntry(RUN_ENTRY_TYPE, record),
@@ -114,7 +121,7 @@ export default function heishi(pi: ExtensionAPI): void {
     if (loaded.error) ctx.ui.notify(loaded.error, "warning");
 
     const restored = restoreRunSnapshots(ctx.sessionManager.getBranch());
-    const reconciled = await reconcileRuns(restored, tmux);
+    const reconciled = await reconcileRuns(restored, hosts);
     coordinator.restore(reconciled);
     for (const run of reconciled) {
       const previous = restored.find((candidate) => candidate.runId === run.runId);
@@ -133,9 +140,9 @@ export default function heishi(pi: ExtensionAPI): void {
     name: "subagent_start",
     label: "Start Subagent",
     description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main prioritizes a user-requested pair, then the parent session's exact pair, and finally a delegation-pool pair. Main may use an isolated Git worktree workspace.",
-    promptSnippet: "Start persistent interactive tmux subagents for delegated work",
+    promptSnippet: "Start persistent interactive subagents in a managed terminal host",
     promptGuidelines: [
-      "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive tmux session or live steering.",
+      "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive terminal session or live steering.",
       ...DELEGATION_BRIEF_GUIDELINES,
       "The optional `mode` parameter overrides the effective Heishi configuration for that run.",
       ...TASK_MODE_GUIDELINES,
@@ -143,7 +150,8 @@ export default function heishi(pi: ExtensionAPI): void {
       "Main mode loads normal Pi extensions, skills, tools, and prompt templates.",
       ...MAIN_MODEL_GUIDELINES,
       "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission defaults to `session` in sub mode and `window` in main mode.",
-      "The optional `workspace` parameter is independent of tmux placement. Main mode uses the effective Heishi workspace when it is omitted; sub mode always uses the shared checkout. An explicit `worktree` is valid only in main mode and isolates repository writes on a retained branch.",
+      "In cmux, `window` opens a surface tab in the caller workspace and `session` opens a surface tab in the shared `Heishi subagents` workspace. In tmux, the existing window and named-session mappings remain unchanged.",
+      "The optional `workspace` parameter is independent of terminal placement. Main mode uses the effective Heishi workspace when it is omitted; sub mode always uses the shared checkout. An explicit `worktree` is valid only in main mode and isolates repository writes on a retained branch.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent shared-workspace writers must edit non-overlapping files. Use main-mode worktree workspaces when writers need isolated checkouts.",
       "After every successful `subagent_start`, use `subagent_control` first only when live interaction is needed, then use `subagent_wait` for every started run; otherwise use `subagent_wait` immediately. Do not inspect, implement, or answer the user until all waits return.",
@@ -221,7 +229,7 @@ export default function heishi(pi: ExtensionAPI): void {
     name: "subagent_control",
     label: "Control Subagent",
     description: "Prompt, steer, follow up, abort, resume, or clean up a persistent subagent by its authoritative run UUID.",
-    promptSnippet: "Prompt, steer, follow up, abort, resume, or clean up a tmux subagent run",
+    promptSnippet: "Prompt, steer, follow up, abort, resume, or clean up a managed subagent run",
     promptGuidelines: [
       "Use `subagent_control` with the full authoritative run UUID returned by `subagent_start`; aliases are display-only.",
       "Include `message` when using `subagent_control` actions `prompt`, `steer`, or `follow_up`.",
@@ -277,10 +285,10 @@ export default function heishi(pi: ExtensionAPI): void {
     name: "subagent_wait",
     label: "Wait for Subagent",
     description: "Wait until a subagent's current delegated work reaches agent_settled, then return its structured report, verified session metadata, and run duration.",
-    promptSnippet: "Wait for a tmux subagent to settle and return its structured report",
+    promptSnippet: "Wait for a managed subagent to settle and return its structured report",
     promptGuidelines: [
       "Use `subagent_wait` with the full run UUID after every successful `subagent_start` and after `subagent_control` starts or changes work; waiting is mandatory before the main agent inspects, implements, or answers with the delegated result.",
-      "Treat the result of `subagent_wait`, which waits for `agent_settled`, as completion; do not infer completion from tmux pane output or `agent_end`.",
+      "Treat the result of `subagent_wait`, which waits for `agent_settled`, as completion; do not infer completion from terminal output or `agent_end`.",
       "When `subagent_wait` returns a blocked report with a structured request, obtain the requested external input in the parent session, resume the worker, send the answer with `subagent_control` action `prompt`, and call `subagent_wait` again.",
     ],
     parameters: Type.Object({
@@ -326,6 +334,8 @@ export default function heishi(pi: ExtensionAPI): void {
       "Omitting subagent_start.mode uses this effective configured value. An explicit mode overrides it for that run.",
       `The current Heishi main-mode workspace default is \`${config.workspace}\`.`,
       "Omitting subagent_start.workspace uses this effective configured value in main mode. Sub mode always uses the shared checkout and rejects an explicit worktree.",
+      `The current Heishi terminal host is \`${config.terminalHost}\`.`,
+      "Auto mode detects tmux or cmux for each new start and resume. Active workers keep their recorded host.",
     ].join("\n");
     const poolGuidance = pairs.length === 0
       ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode remains available when the user explicitly requests an authenticated model."
@@ -392,6 +402,19 @@ export default function heishi(pi: ExtensionAPI): void {
   }
 }
 
+export function currentPiInvocation(
+  argv: readonly string[] = process.argv,
+  executablePath = process.execPath,
+): string[] {
+  const currentScript = argv[1];
+  if (currentScript && !currentScript.startsWith("/$bunfs/root/")) {
+    const absoluteScript = resolve(currentScript);
+    if (existsSync(absoluteScript)) return [executablePath, absoluteScript];
+  }
+  const executable = basename(executablePath).toLowerCase();
+  return /^(node|bun)(\.exe)?$/u.test(executable) ? ["pi"] : [executablePath];
+}
+
 function heishiArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {
   return "settings".startsWith(prefix) ? [{ value: "settings", label: "settings" }] : null;
 }
@@ -431,11 +454,12 @@ function runStatusHeader(result: RunResult, theme: Theme): string {
         ? "warning"
         : "accent";
   const icon = result.status === "completed" ? "✓" : result.status === "failed" ? "✕" : result.status === "running" ? "→" : "!";
-  const location = [
-    result.tmuxTarget ? `pane id ${result.tmuxTarget}` : undefined,
-    result.tmuxWindowId ? `window id ${result.tmuxWindowId}` : undefined,
-    result.tmuxSessionId ? `session id ${result.tmuxSessionId}` : undefined,
-  ].filter(Boolean).join(" · ");
+  const target = result.hostTarget;
+  const location = target?.host === "tmux"
+    ? `tmux · pane ${target.paneId}${target.windowId ? ` · window ${target.windowId}` : ""}${target.sessionId ? ` · session ${target.sessionId}` : ""}`
+    : target?.host === "cmux"
+      ? `cmux · ${target.closeKind} ${target.closeKind === "surface" ? target.surfaceId : target.workspaceId}`
+      : "";
   const worktree = result.workspace === "worktree"
     ? `\n  ${theme.fg("dim", result.worktree
         ? `Worktree: ${result.worktree.path} · ${result.worktree.branch} · base ${result.worktree.baseCommit} · ${result.worktree.state}`

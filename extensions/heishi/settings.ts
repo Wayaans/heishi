@@ -51,7 +51,7 @@ export async function showHeishiSettings(
     const section = await ctx.ui.select(
       scope === "global" ? "Configure Heishi globally" : "Configure Heishi for this project",
       [
-        `Defaults and cleanup (${effective.mode}, ${effective.workspace}, ${approvalLabel(effective.cleanupApproval)})`,
+        `Defaults and cleanup (${effective.mode}, ${effective.workspace}, ${effective.terminalHost}, ${approvalLabel(effective.cleanupApproval)})`,
         `Delegation models (${effective.models.length} pair${effective.models.length === 1 ? "" : "s"})`,
         "Done",
       ],
@@ -135,6 +135,13 @@ async function editDefaults(
         values: scope === "project" ? ["inherit", "shared", "worktree"] : ["shared", "worktree"],
       },
       {
+        id: "terminalHost",
+        label: "Terminal host",
+        description: scopeDescription(scope),
+        currentValue: scope === "project" ? config.terminalHost ?? "inherit" : config.terminalHost ?? "auto",
+        values: scope === "project" ? ["inherit", "auto", "tmux", "cmux"] : ["auto", "tmux", "cmux"],
+      },
+      {
         id: "cleanupApproval",
         label: "Worktree cleanup approval",
         description: "ask: prompt each time, allow: clean without asking",
@@ -188,6 +195,9 @@ function updateDefault(config: HeishiConfig, id: string, value: string): HeishiC
   } else if (id === "workspace") {
     if (value === "inherit") delete updated.workspace;
     else if (value === "shared" || value === "worktree") updated.workspace = value;
+  } else if (id === "terminalHost") {
+    if (value === "inherit") delete updated.terminalHost;
+    else if (value === "auto" || value === "tmux" || value === "cmux") updated.terminalHost = value;
   } else if (id === "cleanupApproval") {
     if (value === "inherit") delete updated.worktree;
     else if (value === "ask" || value === "allow") updated.worktree = { cleanupApproval: value };

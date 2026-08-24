@@ -1,5 +1,12 @@
 import { isAbsolute } from "node:path";
-import { THINKING_LEVELS, type ThinkingLevel } from "./tmux.js";
+import {
+  isUuid,
+  terminalTargetLabel,
+  THINKING_LEVELS,
+  type HostTarget,
+  type TerminalHosts,
+  type ThinkingLevel,
+} from "./terminal-host.js";
 import type { RunRecord, RunStatus, SubagentReport, WorkspaceKind, WorktreeRecord } from "./types.js";
 import { isSafeRelativeCwd } from "./workspace.js";
 
@@ -25,14 +32,13 @@ export function restoreRunSnapshots(entries: readonly unknown[]): RunRecord[] {
 
 export async function reconcileRuns(
   runs: RunRecord[],
-  tmux: {
-    exists(target: string): Promise<boolean>;
-    close(target: string): Promise<void>;
-  },
+  hosts: TerminalHosts,
 ): Promise<RunRecord[]> {
   return Promise.all(runs.map(async (run) => {
-    if (run.paneState !== "open" || !run.tmuxTarget) return run;
-    const target = run.tmuxTarget;
+    if (run.paneState !== "open" || !run.hostTarget) return run;
+    const target = run.hostTarget;
+    const host = hosts.forTarget(target);
+    const label = terminalTargetLabel(target);
     const wasActive = isActive(run.status);
     const update = (paneState: "closed" | "open" | "disconnected", error: string): RunRecord => ({
       ...run,
@@ -44,26 +50,26 @@ export async function reconcileRuns(
 
     let paneExists: boolean;
     try {
-      paneExists = await tmux.exists(target);
+      paneExists = await host.exists(target);
     } catch (error) {
-      return update("disconnected", `Could not inspect restored subagent pane ${target}: ${errorMessage(error)}`);
+      return update("disconnected", `Could not inspect restored subagent terminal target ${label}: ${errorMessage(error)}`);
     }
-    if (!paneExists) return update("disconnected", `Subagent pane ${target} no longer exists`);
+    if (!paneExists) return update("disconnected", `Subagent terminal target ${label} no longer exists`);
 
     let closeError: string | undefined;
     try {
-      await tmux.close(target);
+      await host.close(target);
     } catch (error) {
-      closeError = `Could not close restored subagent pane ${target}: ${errorMessage(error)}`;
+      closeError = `Could not close restored subagent terminal target ${label}: ${errorMessage(error)}`;
     }
     try {
-      if (await tmux.exists(target)) {
-        const suffix = `Subagent pane ${target} still exists after close`;
+      if (await host.exists(target)) {
+        const suffix = `Subagent terminal target ${label} still exists after close`;
         return update("open", closeError ? `${closeError}; ${suffix}` : suffix);
       }
       return update("closed", "Subagent parent connection is unavailable after session restoration");
     } catch (error) {
-      const suffix = `Could not verify whether restored subagent pane ${target} closed: ${errorMessage(error)}`;
+      const suffix = `Could not verify whether restored subagent terminal target ${label} closed: ${errorMessage(error)}`;
       return update("disconnected", closeError ? `${closeError}; ${suffix}` : suffix);
     }
   }));
@@ -79,13 +85,14 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
   const version = run["version"];
   const legacySub = version === 1;
   const legacyShared = version === 1 || version === 2;
+  const hostTarget = normalizeHostTarget(run, version);
   const mode = legacySub ? "sub" : run["mode"];
   const workspace = legacyShared ? "shared" : run["workspace"];
   const worktree = legacyShared ? undefined : normalizeWorktreeRecord(run["worktree"]);
   const validWorkspace = isValidWorkspaceSnapshot(run, mode, workspace, worktree);
   const validModel = typeof run["model"] === "string" || (mode === "main" && run["model"] === undefined);
   const validThinking = isThinkingLevel(run["thinking"]) || (mode === "main" && run["thinking"] === undefined);
-  if ((version !== 1 && version !== 2 && version !== 3)
+  if ((version !== 1 && version !== 2 && version !== 3 && version !== 4)
     || (mode !== "sub" && mode !== "main")
     || !validWorkspace
     || typeof run["runId"] !== "string"
@@ -101,11 +108,11 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
     || typeof run["createdAt"] !== "string"
     || typeof run["updatedAt"] !== "string"
     || OPTIONAL_STRING_FIELDS.some((field) => run[field] !== undefined && typeof run[field] !== "string")
-    || !hasValidPaneMetadata(run)
+    || !hasValidHostMetadata(run, version, hostTarget)
     || (run["report"] !== undefined && !isSubagentReport(run["report"]))) return undefined;
 
   const normalized: RunRecord = {
-    version: 3,
+    version: 4,
     mode,
     workspace: workspace as WorkspaceKind,
     ...(worktree ? { worktree } : {}),
@@ -116,6 +123,7 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
     placement: run["placement"],
     status: run["status"],
     paneState: run["paneState"],
+    ...(hostTarget ? { hostTarget } : {}),
     createdAt: run["createdAt"],
     updatedAt: run["updatedAt"],
   };
@@ -154,17 +162,87 @@ function normalizeWorktreeRecord(value: unknown): WorktreeRecord | undefined {
     : { ...common, state: "removed", resumeCommit: worktree["resumeCommit"] as string };
 }
 
-function hasValidPaneMetadata(run: Record<string, unknown>): boolean {
+function normalizeHostTarget(run: Record<string, unknown>, version: unknown): HostTarget | undefined {
+  if (version === 4) return parseHostTarget(run["hostTarget"]);
+  if (!isTmuxId(run["tmuxTarget"], "%")) return undefined;
+  if (run["paneState"] !== "disconnected"
+    && (!isTmuxId(run["tmuxWindowId"], "@") || !isTmuxId(run["tmuxSessionId"], "$"))) return undefined;
+  return {
+    host: "tmux",
+    paneId: run["tmuxTarget"],
+    ...(isTmuxId(run["tmuxWindowId"], "@") ? { windowId: run["tmuxWindowId"] } : {}),
+    ...(isTmuxId(run["tmuxSessionId"], "$") ? { sessionId: run["tmuxSessionId"] } : {}),
+  };
+}
+
+function hasValidHostMetadata(
+  run: Record<string, unknown>,
+  version: unknown,
+  target: HostTarget | undefined,
+): boolean {
   if (!isOptionalTmuxId(run["tmuxTarget"], "%")
     || !isOptionalTmuxId(run["tmuxWindowId"], "@")
     || !isOptionalTmuxId(run["tmuxSessionId"], "$")) return false;
-  if (run["paneState"] === "open") {
-    return isTmuxId(run["tmuxTarget"], "%")
-      && isTmuxId(run["tmuxWindowId"], "@")
-      && isTmuxId(run["tmuxSessionId"], "$");
+  if (version === 4 && run["hostTarget"] !== undefined && !target) return false;
+  if (run["paneState"] === "open" || run["paneState"] === "disconnected") {
+    if (!target) return false;
   }
-  if (run["paneState"] === "disconnected") return isTmuxId(run["tmuxTarget"], "%");
-  return true;
+  if (run["paneState"] === "open" && target?.host === "tmux" && (!target.windowId || !target.sessionId)) {
+    return false;
+  }
+  if (target?.host === "tmux") {
+    return (run["tmuxTarget"] === undefined || run["tmuxTarget"] === target.paneId)
+      && (run["tmuxWindowId"] === undefined || run["tmuxWindowId"] === target.windowId)
+      && (run["tmuxSessionId"] === undefined || run["tmuxSessionId"] === target.sessionId);
+  }
+  return run["tmuxTarget"] === undefined
+    && run["tmuxWindowId"] === undefined
+    && run["tmuxSessionId"] === undefined;
+}
+
+function parseHostTarget(value: unknown): HostTarget | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const target = value as Record<string, unknown>;
+  if (target["host"] === "tmux"
+    && isTmuxId(target["paneId"], "%")
+    && isOptionalTmuxId(target["windowId"], "@")
+    && isOptionalTmuxId(target["sessionId"], "$")
+    && (target["socketPath"] === undefined || isNonEmptyString(target["socketPath"]))) {
+    return {
+      host: "tmux",
+      paneId: target["paneId"],
+      ...(isTmuxId(target["windowId"], "@") ? { windowId: target["windowId"] } : {}),
+      ...(isTmuxId(target["sessionId"], "$") ? { sessionId: target["sessionId"] } : {}),
+      ...(typeof target["socketPath"] === "string" ? { socketPath: target["socketPath"] } : {}),
+    };
+  }
+  if (target["host"] === "cmux"
+    && isUuid(target["surfaceId"])
+    && isUuid(target["paneId"])
+    && isUuid(target["workspaceId"])
+    && isUuid(target["windowId"])
+    && isNonEmptyString(target["socketPath"])
+    && isOneOf(target["closeKind"], ["surface", "workspace"])
+    && ((target["groupId"] === undefined && target["groupAnchorWorkspaceId"] === undefined)
+      || (isUuid(target["groupId"]) && isUuid(target["groupAnchorWorkspaceId"])))
+    && (target["dedicatedWorkspace"] === undefined || target["dedicatedWorkspace"] === true)
+    && (target["dedicatedWorkspace"] !== true || target["closeKind"] === "surface")) {
+    return {
+      host: "cmux",
+      surfaceId: target["surfaceId"],
+      paneId: target["paneId"],
+      workspaceId: target["workspaceId"],
+      windowId: target["windowId"],
+      socketPath: target["socketPath"],
+      closeKind: target["closeKind"],
+      ...(isUuid(target["groupId"]) ? { groupId: target["groupId"] } : {}),
+      ...(isUuid(target["groupAnchorWorkspaceId"])
+        ? { groupAnchorWorkspaceId: target["groupAnchorWorkspaceId"] }
+        : {}),
+      ...(target["dedicatedWorkspace"] === true ? { dedicatedWorkspace: true } : {}),
+    };
+  }
+  return undefined;
 }
 
 function isOptionalTmuxId(value: unknown, prefix: "%" | "@" | "$"): boolean {

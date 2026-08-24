@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { describe, it } from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { WorktreeCleanupApproval } from "./cleanup.js";
-import heishi from "./index.js";
+import heishi, { currentPiInvocation } from "./index.js";
 import type { ControlInput, RunRecord, RunResult } from "./types.js";
 
 interface RegisteredTool {
@@ -41,6 +41,19 @@ interface RegisteredCommand {
 }
 
 describe("Heishi tool prompt metadata", () => {
+  it("resolves a relative current script before workers change cwd", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-index-test-"));
+    try {
+      const script = join(root, "pi.mjs");
+      await writeFile(script, "");
+      const invocation = currentPiInvocation(["node", relative(process.cwd(), script)], "/bin/node");
+      assert.deepEqual(invocation, ["/bin/node", script]);
+      assert.equal(isAbsolute(invocation[1] ?? ""), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("makes the subagent workflow and concurrent starts discoverable to the main agent", () => {
     const tools: RegisteredTool[] = [];
     const pi = {
@@ -87,6 +100,10 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("reproducing the necessary context");
     }));
     assert.match(start.parameters.properties?.["task"]?.description ?? "", /worker receives no parent conversation/u);
+    assert.ok(start.promptGuidelines?.some((guideline) => {
+      return guideline.includes("`window` opens a surface tab in the caller workspace")
+        && guideline.includes("`session` opens a surface tab in the shared `Heishi subagents` workspace");
+    }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("classify the task by its intended repository side effects")
         && guideline.includes("pass `mode` explicitly");
@@ -470,7 +487,7 @@ describe("Heishi tool prompt metadata", () => {
     }
   });
 
-  it("loads mode, workspace, and cleanup approval from trusted project settings", async () => {
+  it("loads mode, workspace, terminal host, and cleanup approval from trusted project settings", async () => {
     const root = await mkdtemp(join(tmpdir(), "heishi-index-"));
     try {
       const configDirectory = join(root, CONFIG_DIR_NAME);
@@ -478,6 +495,7 @@ describe("Heishi tool prompt metadata", () => {
       await writeFile(join(configDirectory, "heishi.json"), JSON.stringify({
         mode: "main",
         workspace: "worktree",
+        terminalHost: "cmux",
         models: [],
         worktree: { cleanupApproval: "allow" },
       }));
@@ -509,6 +527,7 @@ describe("Heishi tool prompt metadata", () => {
       const prompt = beforeAgentStart({ systemPrompt: "Base" }, ctx).systemPrompt;
       assert.match(prompt, /default mode is `main`/u);
       assert.match(prompt, /workspace default is `worktree`/u);
+      assert.match(prompt, /terminal host is `cmux`/u);
       assert.match(prompt, /cleanup is currently allowed without confirmation/u);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -694,6 +713,8 @@ describe("Heishi tool prompt metadata", () => {
         runId: "12345678-1234-1234-1234-123456789abc",
         alias: "Atalanta",
         status: "running",
+        host: "tmux",
+        hostTarget: { host: "tmux", paneId: "%9", windowId: "@2", sessionId: "$1" },
         tmuxTarget: "%9",
         tmuxWindowId: "@2",
         tmuxSessionId: "$1",
@@ -706,7 +727,7 @@ describe("Heishi tool prompt metadata", () => {
     }).render(200).join("\n");
 
     assert.match(rendered, /^→ Atalanta · 123456  running/u);
-    assert.match(rendered, /pane id %9 · window id @2 · session id \$1/u);
+    assert.match(rendered, /tmux · pane %9 · window @2 · session \$1/u);
     assert.doesNotMatch(rendered, /openai\/model|high/u);
   });
 });
@@ -733,7 +754,7 @@ function cleanupFixture(options: {
     relativeCwd: ".",
   };
   const run: RunRecord = {
-    version: 3,
+    version: 4,
     mode: "main",
     workspace: "worktree",
     worktree,

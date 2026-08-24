@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ScopedModel } from "@earendil-works/pi-coding-agent";
-import { THINKING_LEVELS, type ThinkingLevel } from "./tmux.js";
+import { THINKING_LEVELS, type TerminalHostPreference, type ThinkingLevel } from "./terminal-host.js";
 import type { WorkerMode, WorkspaceKind } from "./types.js";
 
 export interface DelegationPair {
@@ -17,6 +17,7 @@ export type CleanupApproval = "ask" | "allow";
 export interface HeishiConfig {
   mode?: WorkerMode;
   workspace?: WorkspaceKind;
+  terminalHost?: TerminalHostPreference;
   models?: DelegationPair[];
   worktree?: {
     cleanupApproval?: CleanupApproval;
@@ -26,6 +27,7 @@ export interface HeishiConfig {
 export interface EffectiveHeishiConfig {
   mode: WorkerMode;
   workspace: WorkspaceKind;
+  terminalHost: TerminalHostPreference;
   models: DelegationPair[];
   cleanupApproval: CleanupApproval;
 }
@@ -50,6 +52,7 @@ const THINKING_LEVEL_SET = new Set<ThinkingLevel>(THINKING_LEVELS);
 const DEFAULT_CONFIG: EffectiveHeishiConfig = {
   mode: "sub",
   workspace: "shared",
+  terminalHost: "auto",
   models: [],
   cleanupApproval: "ask",
 };
@@ -91,6 +94,7 @@ export function resolveEffectiveConfig(
   return {
     mode: project?.mode ?? global.mode ?? DEFAULT_CONFIG.mode,
     workspace: project?.workspace ?? global.workspace ?? DEFAULT_CONFIG.workspace,
+    terminalHost: project?.terminalHost ?? global.terminalHost ?? DEFAULT_CONFIG.terminalHost,
     models: [...(project?.models ?? global.models ?? DEFAULT_CONFIG.models)],
     cleanupApproval: project?.worktree?.cleanupApproval
       ?? global.worktree?.cleanupApproval
@@ -166,6 +170,14 @@ function parseConfig(value: unknown): HeishiConfig {
       throw new Error("workspace must be shared or worktree");
     }
     config.workspace = workspace;
+  }
+
+  const terminalHost = value["terminalHost"];
+  if (terminalHost !== undefined) {
+    if (terminalHost !== "auto" && terminalHost !== "tmux" && terminalHost !== "cmux") {
+      throw new Error("terminalHost must be auto, tmux, or cmux");
+    }
+    config.terminalHost = terminalHost;
   }
 
   const modelEntries = value["models"];

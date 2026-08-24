@@ -3,7 +3,9 @@ import { describe, it } from "node:test";
 import { RunCoordinator, type CoordinatorDependencies } from "./coordinator.js";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
 import type { ProtocolEnvelope } from "./protocol.js";
-import type { TmuxAdapter, TmuxLaunch, TmuxTarget } from "./tmux.js";
+import { TerminalHostResolver } from "./terminal-host-resolver.js";
+import type { CmuxHostTarget, HostLaunch, HostTarget, TerminalHost } from "./terminal-host.js";
+import { TmuxHost, type TmuxAdapter, type TmuxLaunch, type TmuxTarget } from "./tmux.js";
 import type { RunRecord, WorktreeRecord } from "./types.js";
 import { WorktreeOperationError, type WorktreeAdapter, type WorktreeRollbackResult } from "./worktree.js";
 
@@ -104,6 +106,37 @@ class FakeWorktrees implements WorktreeAdapter {
   }
 }
 
+class FakeCmux implements TerminalHost {
+  readonly kind = "cmux" as const;
+  readonly target: CmuxHostTarget = {
+    host: "cmux",
+    windowId: "11111111-1111-4111-8111-111111111111",
+    workspaceId: "22222222-2222-4222-8222-222222222222",
+    paneId: "33333333-3333-4333-8333-333333333333",
+    surfaceId: "44444444-4444-4444-8444-444444444444",
+    socketPath: "/tmp/cmux.sock",
+    closeKind: "surface",
+    dedicatedWorkspace: true,
+  };
+  launches: HostLaunch[] = [];
+  closed: HostTarget[] = [];
+  existing = false;
+  validated = false;
+
+  async validate(): Promise<void> { this.validated = true; }
+  async launch(spec: HostLaunch): Promise<CmuxHostTarget> {
+    this.launches.push(spec);
+    this.existing = true;
+    return this.target;
+  }
+  async exists(): Promise<boolean> { return this.existing; }
+  async focus(): Promise<void> {}
+  async close(target: HostTarget): Promise<void> {
+    this.closed.push(target);
+    this.existing = false;
+  }
+}
+
 class FakeTmux implements TmuxAdapter {
   validated = false;
   launches: TmuxLaunch[] = [];
@@ -150,7 +183,7 @@ function presentWorktree(worktree: WorktreeRecord): WorktreeRecord {
   return { ...record, state: "present" };
 }
 
-function fixture(ready: Partial<WorkerReady> = {}): {
+function fixture(ready: Partial<WorkerReady> = {}, terminalHost?: TerminalHost): {
   coordinator: RunCoordinator;
   ipc: FakeIpc;
   tmux: FakeTmux;
@@ -173,7 +206,10 @@ function fixture(ready: Partial<WorkerReady> = {}): {
     cwd: "/repo",
     extensionPath: "/repo/extensions/heishi/index.ts",
     piPath: "/bin/pi",
-    tmux,
+    hosts: new TerminalHostResolver(
+      [terminalHost ?? new TmuxHost(tmux)],
+      async () => terminalHost?.kind ?? "tmux",
+    ),
     ipc,
     worktrees,
     persist: (record) => { records.push(structuredClone(record)); },
@@ -197,7 +233,7 @@ async function pause(): Promise<void> {
 
 function completedRun(): RunRecord {
   return {
-    version: 3,
+    version: 4,
     mode: "sub",
     workspace: "shared",
     runId: "run-1",
@@ -264,6 +300,25 @@ Inspect the repository`,
     assert.equal(completed.report?.summary, "Done");
     assert.equal(completed.durationMs, 3_000);
     assert.deepEqual(tmux.closed, ["%9"]);
+  });
+
+  it("runs the lifecycle through a cmux-shaped generic host target", async () => {
+    const cmux = new FakeCmux();
+    const { coordinator, ipc, records } = fixture({}, cmux);
+    const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+
+    assert.equal(cmux.validated, true);
+    assert.deepEqual(started.hostTarget, cmux.target);
+    assert.equal(started.host, "cmux");
+    assert.deepEqual(records.at(-1)?.hostTarget, cmux.target);
+
+    await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
+    const completed = await coordinator.wait(started.runId);
+
+    assert.equal(completed.status, "completed");
+    assert.deepEqual(cmux.closed, [cmux.target]);
+    assert.deepEqual(records.at(-1)?.hostTarget, cmux.target);
+    assert.equal(records.at(-1)?.paneState, "closed");
   });
 
   it("rejects worktree workspace in sub mode before Git or tmux work", async () => {
@@ -887,7 +942,7 @@ Inspect the repository`,
     assert.match(run?.error ?? "", /still exists after close/u);
     await assert.rejects(
       () => coordinator.control({ runId: started.runId, action: "cleanup" }),
-      /pane is closed/u,
+      /terminal target is closed/u,
     );
   });
 
@@ -903,7 +958,7 @@ Inspect the repository`,
     assert.match(run?.error ?? "", /Could not verify.*server unavailable/u);
     await assert.rejects(
       () => coordinator.control({ runId: started.runId, action: "cleanup" }),
-      /pane is closed/u,
+      /terminal target is closed/u,
     );
   });
 
@@ -923,7 +978,7 @@ Inspect the repository`,
     assert.match(failed.error ?? "", /still exists after close/u);
     await assert.rejects(
       () => coordinator.control({ runId: failed.runId, action: "cleanup" }),
-      /pane is closed/u,
+      /terminal target is closed/u,
     );
   });
 
@@ -1129,7 +1184,7 @@ Inspect the repository`,
 
     await assert.rejects(
       () => coordinator.control({ runId: "run-1", action: "resume" }),
-      /Verify the subagent pane is closed before resume/u,
+      /Verify the subagent terminal target is closed before resume/u,
     );
     assert.deepEqual(tmux.launches, []);
   });

@@ -1,21 +1,16 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { ProcessCommandExecutor, type CommandExecutor } from "./command-executor.js";
+import {
+  tmuxHostTarget,
+  type HostLaunch,
+  type HostTarget,
+  type Placement,
+  type TerminalHost,
+  type TmuxHostTarget,
+} from "./terminal-host.js";
+import { shellQuote } from "./worker-command.js";
 
-const execFileAsync = promisify(execFile);
-
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-export type ThinkingLevel = typeof THINKING_LEVELS[number];
-export type Placement = "pane" | "window" | "session";
-
-export interface CommandExecutor {
-  exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }>;
-}
-
-export class ProcessCommandExecutor implements CommandExecutor {
-  async exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-    return execFileAsync(command, args, { encoding: "utf8", timeout: 30_000 });
-  }
-}
+export { THINKING_LEVELS, type Placement, type ThinkingLevel } from "./terminal-host.js";
+export { buildPiCommand, type PiCommandOptions } from "./worker-command.js";
 
 export interface TmuxLaunch {
   placement: Placement;
@@ -40,8 +35,31 @@ export interface TmuxAdapter {
   close(target: string): Promise<void>;
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+export class TmuxHost implements TerminalHost {
+  readonly kind = "tmux" as const;
+
+  constructor(private readonly tmux: TmuxAdapter) {}
+
+  validate(): Promise<void> {
+    return this.tmux.validate();
+  }
+
+  async launch(spec: HostLaunch): Promise<TmuxHostTarget> {
+    const target = await this.tmux.launch(spec);
+    return tmuxHostTarget(target);
+  }
+
+  exists(target: HostTarget): Promise<boolean> {
+    return this.tmux.exists(requireTmuxTarget(target).paneId);
+  }
+
+  focus(target: HostTarget): Promise<void> {
+    return this.tmux.focus(requireTmuxTarget(target).paneId);
+  }
+
+  close(target: HostTarget): Promise<void> {
+    return this.tmux.close(requireTmuxTarget(target).paneId);
+  }
 }
 
 export class Tmux implements TmuxAdapter {
@@ -147,45 +165,9 @@ export class Tmux implements TmuxAdapter {
   }
 }
 
-export interface PiCommandOptions {
-  mode: "sub" | "main";
-  piPath: string;
-  extensionPath: string;
-  model?: string;
-  thinking?: ThinkingLevel;
-  name: string;
-  projectTrusted: boolean;
-  sessionFile?: string;
-}
-
-export function buildPiCommand(options: PiCommandOptions): string[] {
-  const command = options.mode === "main"
-    ? buildMainPiCommand(options)
-    : buildSubPiCommand(options);
-  if (options.sessionFile) command.push("--session", options.sessionFile);
-  return command;
-}
-
-function buildSubPiCommand(options: PiCommandOptions): string[] {
-  if (!options.model || !options.thinking) throw new Error("Subagent model and thinking are required");
-  return [
-    options.piPath,
-    "--no-extensions",
-    "-e", options.extensionPath,
-    "--no-skills",
-    "--no-prompt-templates",
-    "--model", options.model,
-    "--thinking", options.thinking,
-    "--name", options.name,
-  ];
-}
-
-function buildMainPiCommand(options: PiCommandOptions): string[] {
-  const command = [options.piPath, "-e", options.extensionPath];
-  if (options.model) command.push("--model", options.model);
-  if (options.thinking) command.push("--thinking", options.thinking);
-  command.push("--name", options.name, options.projectTrusted ? "--approve" : "--no-approve");
-  return command;
+function requireTmuxTarget(target: HostTarget): TmuxHostTarget {
+  if (target.host !== "tmux") throw new Error("Tmux host received a cmux target");
+  return target;
 }
 
 function isTmuxId(value: string | undefined, prefix: "%" | "@" | "$"): value is string {

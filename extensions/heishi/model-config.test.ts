@@ -21,11 +21,13 @@ import {
 const globalConfig: HeishiConfig = {
   mode: "sub",
   workspace: "shared",
+  terminalHost: "tmux",
   models: [{ model: "provider/global", thinking: "high" }],
   worktree: { cleanupApproval: "ask" },
 };
 const projectConfig: HeishiConfig = {
   mode: "main",
+  terminalHost: "cmux",
   models: [{ model: "provider/project", thinking: "medium" }],
   worktree: { cleanupApproval: "allow" },
 };
@@ -42,12 +44,14 @@ describe("Heishi delegation model configuration", () => {
       assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, true)).config, {
         mode: "main",
         workspace: "shared",
+        terminalHost: "cmux",
         models: projectConfig.models,
         cleanupApproval: "allow",
       });
       assert.deepEqual((await loadEffectiveConfig(globalPath, projectPath, false)).config, {
         mode: "sub",
         workspace: "shared",
+        terminalHost: "tmux",
         models: globalConfig.models,
         cleanupApproval: "ask",
       });
@@ -66,6 +70,7 @@ describe("Heishi delegation model configuration", () => {
       assert.deepEqual(loaded.config, {
         mode: "sub",
         workspace: "shared",
+        terminalHost: "tmux",
         models: globalConfig.models,
         cleanupApproval: "ask",
       });
@@ -78,12 +83,14 @@ describe("Heishi delegation model configuration", () => {
     assert.deepEqual(resolveEffectiveConfig({}, { workspace: "worktree" }), {
       mode: "sub",
       workspace: "worktree",
+      terminalHost: "auto",
       models: [],
       cleanupApproval: "ask",
     });
     assert.deepEqual(resolveEffectiveConfig(globalConfig, { workspace: "worktree" }), {
       mode: "sub",
       workspace: "worktree",
+      terminalHost: "tmux",
       models: globalConfig.models,
       cleanupApproval: "ask",
     });

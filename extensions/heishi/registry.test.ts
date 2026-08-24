@@ -1,11 +1,23 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { reconcileRuns, restoreRunSnapshots } from "./registry.js";
+import { TerminalHostResolver } from "./terminal-host-resolver.js";
+import type { TerminalHosts } from "./terminal-host.js";
+import { TmuxHost, type TmuxAdapter } from "./tmux.js";
 import type { RunRecord } from "./types.js";
+
+function restorationHosts(adapter: Pick<TmuxAdapter, "exists" | "close">): TerminalHosts {
+  return new TerminalHostResolver([new TmuxHost({
+    validate: async () => undefined,
+    launch: async () => { throw new Error("Restoration cannot launch a worker"); },
+    focus: async () => undefined,
+    ...adapter,
+  })], async () => "tmux");
+}
 
 function makeRunRecord(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
-    version: 3,
+    version: 4,
     mode: "sub",
     workspace: "shared",
     runId: "run-1",
@@ -17,6 +29,7 @@ function makeRunRecord(overrides: Partial<RunRecord> = {}): RunRecord {
     placement: "pane",
     status: "running",
     paneState: "open",
+    hostTarget: { host: "tmux", paneId: "%1", windowId: "@1", sessionId: "$1" },
     tmuxTarget: "%1",
     tmuxWindowId: "@1",
     tmuxSessionId: "$1",
@@ -42,24 +55,105 @@ describe("run registry restoration", () => {
   it("normalizes legacy version-1 records to sub mode", () => {
     const legacy = { ...makeRunRecord(), version: 1 } as Record<string, unknown>;
     delete legacy["mode"];
+    delete legacy["hostTarget"];
 
     const restored = restoreRunSnapshots([
       { type: "custom", customType: "heishi:subagent-run", data: legacy },
     ]);
 
-    assert.equal(restored[0]?.version, 3);
+    assert.equal(restored[0]?.version, 4);
     assert.equal(restored[0]?.mode, "sub");
     assert.equal(restored[0]?.workspace, "shared");
   });
 
+  it("restores targetless closed legacy records", () => {
+    for (const version of [1, 2, 3] as const) {
+      const legacy = {
+        ...makeRunRecord({ status: "completed", paneState: "closed" }),
+        version,
+      } as Record<string, unknown>;
+      delete legacy["hostTarget"];
+      delete legacy["tmuxTarget"];
+      delete legacy["tmuxWindowId"];
+      delete legacy["tmuxSessionId"];
+      if (version === 1) delete legacy["mode"];
+      if (version <= 2) delete legacy["workspace"];
+
+      assert.equal(restoreRunSnapshots([
+        { type: "custom", customType: "heishi:subagent-run", data: legacy },
+      ]).length, 1, `version ${version}`);
+    }
+  });
+
+  it("normalizes version-3 tmux records into version-4 host targets", () => {
+    const legacy = { ...makeRunRecord(), version: 3 } as Record<string, unknown>;
+    delete legacy["hostTarget"];
+
+    const restored = restoreRunSnapshots([
+      { type: "custom", customType: "heishi:subagent-run", data: legacy },
+    ]);
+
+    assert.deepEqual(restored[0]?.hostTarget, {
+      host: "tmux",
+      paneId: "%1",
+      windowId: "@1",
+      sessionId: "$1",
+    });
+
+    const disconnected = { ...legacy, paneState: "disconnected", status: "failed" } as Record<string, unknown>;
+    delete disconnected["tmuxWindowId"];
+    delete disconnected["tmuxSessionId"];
+    assert.deepEqual(restoreRunSnapshots([
+      { type: "custom", customType: "heishi:subagent-run", data: disconnected },
+    ])[0]?.hostTarget, { host: "tmux", paneId: "%1" });
+  });
+
+  it("restores cmux UUID targets and rejects malformed IDs", () => {
+    const target = {
+      host: "cmux" as const,
+      windowId: "11111111-1111-4111-8111-111111111111",
+      workspaceId: "22222222-2222-4222-8222-222222222222",
+      paneId: "33333333-3333-4333-8333-333333333333",
+      surfaceId: "44444444-4444-4444-8444-444444444444",
+      socketPath: "/tmp/cmux.sock",
+      closeKind: "workspace" as const,
+      groupId: "55555555-5555-4555-8555-555555555555",
+      groupAnchorWorkspaceId: "66666666-6666-4666-8666-666666666666",
+    };
+    const cmux = makeRunRecord({ hostTarget: target });
+    delete cmux.tmuxTarget;
+    delete cmux.tmuxWindowId;
+    delete cmux.tmuxSessionId;
+    assert.deepEqual(restoreRunSnapshots([
+      { type: "custom", customType: "heishi:subagent-run", data: cmux },
+    ])[0]?.hostTarget, target);
+
+    const { groupId: _groupId, groupAnchorWorkspaceId: _groupAnchorWorkspaceId, ...ungrouped } = target;
+    const dedicatedTarget = { ...ungrouped, closeKind: "surface" as const, dedicatedWorkspace: true as const };
+    assert.deepEqual(restoreRunSnapshots([{
+      type: "custom",
+      customType: "heishi:subagent-run",
+      data: { ...cmux, hostTarget: dedicatedTarget },
+    }])[0]?.hostTarget, dedicatedTarget);
+
+    for (const malformedTarget of [
+      { ...target, surfaceId: "surface:1" },
+      { ...target, groupAnchorWorkspaceId: undefined },
+      { ...dedicatedTarget, closeKind: "workspace" },
+    ]) {
+      const malformed = { ...cmux, hostTarget: malformedTarget };
+      assert.deepEqual(restoreRunSnapshots([
+        { type: "custom", customType: "heishi:subagent-run", data: malformed },
+      ]), []);
+    }
+  });
+
   it("rejects pane states without the metadata needed to manage them", () => {
     for (const malformed of [
-      { ...makeRunRecord(), tmuxTarget: undefined },
-      { ...makeRunRecord(), tmuxWindowId: undefined },
-      { ...makeRunRecord(), tmuxSessionId: undefined },
+      { ...makeRunRecord(), hostTarget: undefined },
       {
         ...makeRunRecord({ status: "failed", paneState: "disconnected" }),
-        tmuxTarget: undefined,
+        hostTarget: undefined,
       },
     ]) {
       assert.deepEqual(restoreRunSnapshots([
@@ -96,6 +190,7 @@ describe("run registry restoration", () => {
     }
 
     const closedWithoutTargets = makeRunRecord({ status: "completed", paneState: "closed" });
+    delete closedWithoutTargets.hostTarget;
     delete closedWithoutTargets.tmuxTarget;
     delete closedWithoutTargets.tmuxWindowId;
     delete closedWithoutTargets.tmuxSessionId;
@@ -293,17 +388,21 @@ describe("run registry restoration", () => {
   it("normalizes version-2 records to shared workspace", () => {
     const legacy = { ...makeRunRecord(), version: 2 } as Record<string, unknown>;
     delete legacy["workspace"];
+    delete legacy["hostTarget"];
 
     const restored = restoreRunSnapshots([
       { type: "custom", customType: "heishi:subagent-run", data: legacy },
     ]);
 
-    assert.equal(restored[0]?.version, 3);
+    assert.equal(restored[0]?.version, 4);
     assert.equal(restored[0]?.workspace, "shared");
   });
 
   it("marks restored open panes disconnected when tmux no longer has them", async () => {
-    const restored = await reconcileRuns([makeRunRecord()], { exists: async () => false, close: async () => undefined });
+    const restored = await reconcileRuns([makeRunRecord()], restorationHosts({
+      exists: async () => false,
+      close: async () => undefined,
+    }));
 
     assert.equal(restored[0]?.paneState, "disconnected");
     assert.equal(restored[0]?.status, "failed");
@@ -313,10 +412,10 @@ describe("run registry restoration", () => {
   it("closes restored panes that no longer have a parent IPC connection", async () => {
     const closed: string[] = [];
     let exists = true;
-    const restored = await reconcileRuns([makeRunRecord()], {
+    const restored = await reconcileRuns([makeRunRecord()], restorationHosts({
       exists: async () => exists,
       close: async (target) => { closed.push(target); exists = false; },
-    });
+    }));
 
     assert.deepEqual(closed, ["%1"]);
     assert.equal(restored[0]?.paneState, "closed");
@@ -325,10 +424,10 @@ describe("run registry restoration", () => {
   });
 
   it("keeps restored panes open when close verification still finds them", async () => {
-    const restored = await reconcileRuns([makeRunRecord()], {
+    const restored = await reconcileRuns([makeRunRecord()], restorationHosts({
       exists: async () => true,
       close: async () => undefined,
-    });
+    }));
 
     assert.equal(restored[0]?.paneState, "open");
     assert.equal(restored[0]?.status, "failed");

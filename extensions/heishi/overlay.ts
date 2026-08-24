@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { RunCoordinator } from "./coordinator.js";
 import { reportMarkdown, shortRunId } from "./rendering.js";
+import { terminalTargetLabel } from "./terminal-host.js";
 import type { RunRecord, RunStatus } from "./types.js";
 
 type OverlayAction = "select" | "steer" | "follow_up" | "abort" | "details" | "close";
@@ -70,7 +71,7 @@ export async function showSubagentOverlay(
       continue;
     }
     if (selection.action === "abort") {
-      if (await ctx.ui.confirm("Abort subagent", `Abort ${run.alias} and close its pane?`)) {
+      if (await ctx.ui.confirm("Abort subagent", `Abort ${run.alias} and close its terminal target?`)) {
         await coordinator.control({ runId: run.runId, action: "abort" });
       }
       continue;
@@ -82,7 +83,7 @@ export async function showSubagentOverlay(
     }
     if (run.workerSessionFile) {
       const resumed = await coordinator.control({ runId: run.runId, action: "resume" });
-      if (resumed.tmuxTarget) await coordinator.control({ runId: run.runId, action: "focus" });
+      if (resumed.hostTarget) await coordinator.control({ runId: run.runId, action: "focus" });
       return;
     }
     await showDetails(ctx, run);
@@ -214,7 +215,7 @@ function statusColor(status: RunStatus): ThemeColor {
 }
 
 function paneLabel(run: RunRecord): string {
-  return run.paneState === "open" ? "pane open" : run.paneState;
+  return run.paneState === "open" ? `${run.hostTarget?.host ?? "terminal"} open` : run.paneState;
 }
 
 function elapsed(run: RunRecord): string {
@@ -243,7 +244,7 @@ async function showDetails(ctx: ExtensionCommandContext, run: RunRecord): Promis
         `Worktree state: ${run.worktree.state}`,
       ] : []),
       `Model/thinking: ${run.model ?? "not selected"} / ${run.thinking ?? "not selected"}`,
-      `Pane: ${run.paneState}${run.tmuxTarget ? ` (${run.tmuxTarget})` : ""}`,
+      `Terminal target: ${run.paneState}${run.hostTarget ? ` (${terminalTargetLabel(run.hostTarget)})` : ""}`,
       `Session: ${run.workerSessionFile ?? "not created"}`,
       `Task: ${run.taskPreview}`,
       run.error ? `Error: ${run.error}` : "",

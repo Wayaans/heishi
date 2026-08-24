@@ -40,6 +40,26 @@ describe("Heishi settings", () => {
     }
   });
 
+  it("saves the global terminal host selection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-settings-"));
+    try {
+      const paths = { global: join(root, "global.json"), project: join(root, "project.json") };
+      let selections = 0;
+      const ctx = settingsContext({
+        select(_title, options) {
+          selections += 1;
+          return Promise.resolve(selections === 1 ? options[0] : selections === 2 ? options[0] : "Done");
+        },
+        custom: toggleThirdSetting,
+      });
+
+      assert.equal(await showHeishiSettings(ctx, paths), true);
+      assert.equal((await loadConfig(paths.global)).config.terminalHost, "tmux");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("saves project overrides without copying inherited global settings", async () => {
     const root = await mkdtemp(join(tmpdir(), "heishi-settings-"));
     try {
@@ -89,13 +109,26 @@ function settingsContext(overrides: UIOverrides): ExtensionCommandContext {
   } as unknown as ExtensionCommandContext;
 }
 
-async function toggleFirstSetting<T>(
-  factory: (
-    tui: TUI,
-    theme: Theme,
-    keybindings: KeybindingsManager,
-    done: (result: T) => void,
-  ) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+type SettingsFactory<T> = (
+  tui: TUI,
+  theme: Theme,
+  keybindings: KeybindingsManager,
+  done: (result: T) => void,
+) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>;
+
+async function toggleThirdSetting<T>(
+  factory: SettingsFactory<T>,
+): Promise<T> {
+  return interactWithSettings(factory, ["\x1b[B", "\x1b[B", " ", "\x1b"]);
+}
+
+async function toggleFirstSetting<T>(factory: SettingsFactory<T>): Promise<T> {
+  return interactWithSettings(factory, [" ", "\x1b"]);
+}
+
+async function interactWithSettings<T>(
+  factory: SettingsFactory<T>,
+  inputs: string[],
 ): Promise<T> {
   let result!: T;
   let finished!: () => void;
@@ -112,8 +145,7 @@ async function toggleFirstSetting<T>(
       finished();
     },
   );
-  component.handleInput?.(" ");
-  component.handleInput?.("\x1b");
+  for (const input of inputs) component.handleInput?.(input);
   await done;
   return result;
 }

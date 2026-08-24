@@ -1,8 +1,18 @@
 import { randomInt, randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 import type { IpcAdapter, WorkerChannel, WorkerReady } from "./ipc.js";
 import type { ProtocolEnvelope } from "./protocol.js";
 import { isActive } from "./registry.js";
-import { buildPiCommand, THINKING_LEVELS, type ThinkingLevel, type TmuxAdapter, type TmuxTarget } from "./tmux.js";
+import {
+  terminalTargetLabel,
+  THINKING_LEVELS,
+  type HostTarget,
+  type TerminalHost,
+  type TerminalHostPreference,
+  type TerminalHosts,
+  type ThinkingLevel,
+} from "./terminal-host.js";
+import { buildPiCommand } from "./worker-command.js";
 import {
   resultFromRun,
   type ControlInput,
@@ -31,8 +41,9 @@ const MYTHOLOGICAL_NAMES = [
 export interface CoordinatorDependencies {
   cwd: string;
   extensionPath: string;
-  piPath: string;
-  tmux: TmuxAdapter;
+  piPath: string | readonly string[];
+  hosts: TerminalHosts;
+  hostPreference?: () => TerminalHostPreference;
   ipc: IpcAdapter;
   worktrees: WorktreeAdapter;
   persist(record: RunRecord): void;
@@ -81,6 +92,7 @@ export class RunCoordinator {
   private readonly newToken: () => string;
   private readonly chooseAlias: () => string;
   private readonly now: () => string;
+  private readonly hosts: TerminalHosts;
   private shuttingDown = false;
 
   constructor(private readonly dependencies: CoordinatorDependencies) {
@@ -88,6 +100,7 @@ export class RunCoordinator {
     this.newToken = dependencies.newToken ?? randomUUID;
     this.chooseAlias = dependencies.chooseAlias ?? (() => MYTHOLOGICAL_NAMES[randomInt(MYTHOLOGICAL_NAMES.length)] ?? "Atalanta");
     this.now = dependencies.now ?? (() => new Date().toISOString());
+    this.hosts = dependencies.hosts;
   }
 
   async start(input: StartInput, signal?: AbortSignal): Promise<RunResult> {
@@ -100,7 +113,7 @@ export class RunCoordinator {
     const runId = this.newRunId();
     const timestamp = this.now();
     const run: RunRecord = {
-      version: 3,
+      version: 4,
       mode,
       workspace,
       runId,
@@ -124,7 +137,7 @@ export class RunCoordinator {
     let launchAttempted = false;
     try {
       throwIfStartCancelled(startOperation, signal);
-      await this.dependencies.tmux.validate();
+      const host = await this.hosts.resolve(this.hostPreference());
       throwIfStartCancelled(startOperation, signal);
       this.update(run, { status: "starting" });
       if (run.workspace === "worktree") {
@@ -151,7 +164,7 @@ export class RunCoordinator {
       throwIfStartCancelled(startOperation, signal);
 
       launchAttempted = true;
-      await this.launchWorker(run, runtime, token, false);
+      await this.launchWorker(run, runtime, token, false, host);
       throwIfStartCancelled(startOperation, signal);
 
       if (signal) {
@@ -221,8 +234,8 @@ export class RunCoordinator {
     }
 
     if (input.action === "focus") {
-      if (run.paneState !== "open" || !run.tmuxTarget) throw new Error("Subagent pane is not open");
-      await this.dependencies.tmux.focus(run.tmuxTarget);
+      if (run.paneState !== "open" || !run.hostTarget) throw new Error("Subagent terminal target is not open");
+      await this.hosts.forTarget(run.hostTarget).focus(run.hostTarget);
       return resultFromRun(run);
     }
     if (input.action === "resume") {
@@ -367,20 +380,20 @@ export class RunCoordinator {
     if (run.workspace !== "worktree") throw new Error("Shared workspace runs cannot be cleaned up");
     if (!run.worktree) throw new Error("Worktree run has no prepared workspace to clean up");
     if (isActive(run.status)) throw new Error("Worktree cleanup requires a settled run");
-    if (run.paneState !== "closed") throw new Error("Verify the subagent pane is closed before worktree cleanup");
+    if (run.paneState !== "closed") throw new Error("Verify the subagent terminal target is closed before worktree cleanup");
     return run.worktree;
   }
 
   private async resume(run: RunRecord, lifecycle: LifecycleOperation): Promise<RunResult> {
-    if (run.paneState !== "closed") throw new Error("Verify the subagent pane is closed before resume");
+    if (run.paneState !== "closed") throw new Error("Verify the subagent terminal target is closed before resume");
     if (!run.workerSessionFile || !run.workerSessionId) {
       throw new Error("Subagent has no persisted worker session to resume");
     }
     const token = this.newToken();
-    let launchedTarget: TmuxTarget | undefined;
+    let launchedTarget: HostTarget | undefined;
     try {
       throwIfResumeCancelled(lifecycle);
-      await this.dependencies.tmux.validate();
+      const host = await this.hosts.resolve(this.hostPreference());
       throwIfResumeCancelled(lifecycle);
       if (run.workspace === "worktree") {
         if (!run.worktree) throw new Error("Worktree run is missing workspace metadata");
@@ -403,7 +416,7 @@ export class RunCoordinator {
       };
       this.runtimes.set(run.runId, runtime);
       throwIfResumeCancelled(lifecycle);
-      launchedTarget = await this.launchWorker(run, runtime, token, true);
+      launchedTarget = await this.launchWorker(run, runtime, token, true, host);
       throwIfResumeCancelled(lifecycle);
       const ready = await waitForWorkerReady(channel, run.mode);
       throwIfResumeCancelled(lifecycle);
@@ -421,7 +434,7 @@ export class RunCoordinator {
       if (runtime) runtime.finishing = true;
       await runtime?.channel.close().catch(() => undefined);
       const paneResult = launchedTarget
-        ? await this.closePaneAndVerify(launchedTarget.paneId)
+        ? await this.closeTargetAndVerify(launchedTarget)
         : undefined;
       const worktree = error instanceof WorktreeOperationError ? error.worktree : undefined;
       const failure = cancelled
@@ -449,7 +462,8 @@ export class RunCoordinator {
     runtime: Runtime,
     token: string,
     resume: boolean,
-  ): Promise<TmuxTarget> {
+    host: TerminalHost,
+  ): Promise<HostTarget> {
     const title = `${run.alias} · ${shortId(run.runId)}`;
     const commandOptions = {
       mode: run.mode,
@@ -463,20 +477,16 @@ export class RunCoordinator {
       projectTrusted: this.dependencies.projectTrusted,
       ...(resume && run.workerSessionFile ? { sessionFile: run.workerSessionFile } : {}),
     };
-    const target = await this.dependencies.tmux.launch({
+    const target = await host.launch({
       placement: run.placement,
       ...(run.placement === "session" ? { sessionName: SUBAGENT_SESSION_NAME } : {}),
       cwd: run.workspace === "worktree" && run.worktree ? worktreeCwd(run.worktree) : run.cwd,
       title,
       command: buildPiCommand(commandOptions),
       environment: workerEnvironment(run.runId, token, runtime.channel.socketPath, resume, run.mode),
+      launcherDirectory: dirname(runtime.channel.socketPath),
     });
-    this.update(run, {
-      paneState: "open",
-      tmuxTarget: target.paneId,
-      tmuxWindowId: target.windowId,
-      tmuxSessionId: target.sessionId,
-    });
+    this.setHostTarget(run, target);
     return target;
   }
 
@@ -553,8 +563,8 @@ export class RunCoordinator {
         );
       }
     }
-    if (!runtime && run.tmuxTarget && run.paneState !== "closed") {
-      const paneResult = await this.closePaneAndVerify(run.tmuxTarget);
+    if (!runtime && run.hostTarget && run.paneState !== "closed") {
+      const paneResult = await this.closeTargetAndVerify(run.hostTarget);
       this.update(run, {
         paneState: paneResult.paneState,
         ...(isActive(run.status) ? { status: "cancelled", completedAt: this.now() } : {}),
@@ -606,8 +616,8 @@ export class RunCoordinator {
     runtime.finishing = true;
     await runtime.channel.close().catch(() => undefined);
     const paneResult = closePane
-      ? run.tmuxTarget
-        ? await this.closePaneAndVerify(run.tmuxTarget)
+      ? run.hostTarget
+        ? await this.closeTargetAndVerify(run.hostTarget)
         : { paneState: "closed" as const }
       : { paneState: "disconnected" as const };
     this.update(run, {
@@ -627,8 +637,8 @@ export class RunCoordinator {
       runtime.finishing = true;
       await runtime.channel.close().catch(() => undefined);
     }
-    const paneResult = run.tmuxTarget
-      ? await this.closePaneAndVerify(run.tmuxTarget)
+    const paneResult = run.hostTarget
+      ? await this.closeTargetAndVerify(run.hostTarget)
       : { paneState: "closed" as const };
     this.update(run, {
       status: "failed",
@@ -640,31 +650,53 @@ export class RunCoordinator {
     runtime?.settled.resolve();
   }
 
-  private async closePaneAndVerify(target: string): Promise<{
+  private async closeTargetAndVerify(target: HostTarget): Promise<{
     paneState: "closed" | "open" | "disconnected";
     error?: string;
   }> {
     let closeError: string | undefined;
     try {
-      await this.dependencies.tmux.close(target);
+      await this.hosts.forTarget(target).close(target);
     } catch (error) {
-      closeError = `Could not close subagent pane ${target}: ${errorMessage(error)}`;
+      closeError = `Could not close subagent terminal target ${terminalTargetLabel(target)}: ${errorMessage(error)}`;
     }
     try {
-      if (!await this.dependencies.tmux.exists(target)) return { paneState: "closed" };
+      if (!await this.hosts.forTarget(target).exists(target)) return { paneState: "closed" };
       return {
         paneState: "open",
-        error: combineErrors(closeError, `Subagent pane ${target} still exists after close`),
+        error: combineErrors(closeError, `Subagent terminal target ${terminalTargetLabel(target)} still exists after close`),
       };
     } catch (error) {
       return {
         paneState: "disconnected",
         error: combineErrors(
           closeError,
-          `Could not verify whether subagent pane ${target} closed: ${errorMessage(error)}`,
+          `Could not verify whether subagent terminal target ${terminalTargetLabel(target)} closed: ${errorMessage(error)}`,
         ),
       };
     }
+  }
+
+  private setHostTarget(run: RunRecord, target: HostTarget): void {
+    if (target.host === "tmux") {
+      if (!target.windowId || !target.sessionId) throw new Error("Tmux launch returned incomplete target metadata");
+      this.update(run, {
+        paneState: "open",
+        hostTarget: target,
+        tmuxTarget: target.paneId,
+        tmuxWindowId: target.windowId,
+        tmuxSessionId: target.sessionId,
+      });
+      return;
+    }
+    delete run.tmuxTarget;
+    delete run.tmuxWindowId;
+    delete run.tmuxSessionId;
+    this.update(run, { paneState: "open", hostTarget: target });
+  }
+
+  private hostPreference(): TerminalHostPreference {
+    return this.dependencies.hostPreference?.() ?? "auto";
   }
 
   private requireRun(runId: string): RunRecord {

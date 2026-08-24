@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Tmux, buildPiCommand, type CommandExecutor } from "./tmux.js";
+import type { CommandExecutor } from "./command-executor.js";
+import { Tmux, buildPiCommand } from "./tmux.js";
 
 class FakeExecutor implements CommandExecutor {
   readonly calls: Array<{ command: string; args: string[] }> = [];
@@ -235,6 +236,21 @@ describe("Pi command construction", () => {
       "--approve",
     ]);
     assert.equal(command.some((argument) => argument.startsWith("--no-")), false);
+  });
+
+  it("supports an absolute runtime and script invocation when pi is not on the worker PATH", () => {
+    assert.deepEqual(buildPiCommand({
+      mode: "main",
+      piPath: ["/usr/bin/node", "/opt/pi/dist/cli.js"],
+      extensionPath: "/repo/extensions/heishi/index.ts",
+      name: "Subagent: Circe · 123456",
+      projectTrusted: true,
+    }).slice(0, 4), [
+      "/usr/bin/node",
+      "/opt/pi/dist/cli.js",
+      "-e",
+      "/repo/extensions/heishi/index.ts",
+    ]);
   });
 
   it("lets Pi choose main model and thinking while mirroring untrusted project state", () => {
