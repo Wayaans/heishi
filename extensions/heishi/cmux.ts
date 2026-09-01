@@ -18,15 +18,14 @@ const REQUIRED_METHODS = [
   "surface.list",
   "surface.focus",
   "surface.close",
+  "tab.action",
   "window.focus",
-  "workspace.create",
   "workspace.list",
   "workspace.select",
   "workspace.close",
   "workspace.group.list",
   "workspace.group.delete",
 ] as const;
-const DEDICATED_WORKSPACE_TITLE = "Heishi subagents";
 const processCommandExecutor = new ProcessCommandExecutor();
 const managedWorkspaces = new WeakMap<CommandExecutor, Map<string, ManagedWorkspace>>();
 
@@ -40,7 +39,6 @@ interface CmuxContext {
 }
 
 interface ManagedWorkspace {
-  workspaceId: string | undefined;
   topologyOperation: Promise<void>;
 }
 
@@ -105,7 +103,6 @@ export class Cmux implements TerminalHost {
     const context = this.requireContext();
     const launcherPath = await createLauncher(spec);
     const surfaceCommand = shellQuote(launcherPath);
-    const workspaceCommand = `exec ${surfaceCommand}`;
     try {
       if (spec.placement === "pane") {
         const result = await this.rpc(context, "surface.split", {
@@ -118,7 +115,7 @@ export class Cmux implements TerminalHost {
         });
         const surfaceId = requireUuid(result["surface_id"], "cmux split surface ID");
         try {
-          return {
+          const target: CmuxHostTarget = {
             host: "cmux",
             windowId: requireMatchingUuid(result["window_id"], "cmux split window ID", context.windowId),
             workspaceId: requireMatchingUuid(
@@ -131,6 +128,8 @@ export class Cmux implements TerminalHost {
             socketPath: context.socketPath,
             closeKind: "surface",
           };
+          await this.renameSurface(context, target, spec.title);
+          return target;
         } catch (error) {
           return this.rollbackAfterFailure(
             context,
@@ -140,16 +139,13 @@ export class Cmux implements TerminalHost {
           );
         }
       }
-      return spec.placement === "session"
-        ? await this.launchInDedicatedWorkspace(context, spec, surfaceCommand, workspaceCommand)
-        : await this.createSurface(
-            context,
-            context.workspaceId,
-            context.paneId,
-            spec,
-            surfaceCommand,
-            false,
-          );
+      return await this.createSurface(
+        context,
+        context.workspaceId,
+        context.paneId,
+        spec,
+        surfaceCommand,
+      );
     } catch (error) {
       await rm(launcherPath, { force: true });
       throw error;
@@ -214,113 +210,12 @@ export class Cmux implements TerminalHost {
     }
   }
 
-  private async createWorkspace(
-    context: CmuxContext,
-    spec: HostLaunch,
-    initialCommand: string,
-    groupId?: string,
-  ): Promise<CmuxHostTarget> {
-    const result = await this.rpc(context, "workspace.create", {
-      window_id: context.windowId,
-      title: spec.title,
-      cwd: spec.cwd,
-      initial_command: initialCommand,
-      focus: false,
-      ...(groupId ? { group_id: groupId } : {}),
-    });
-    const workspaceId = requireUuid(result["workspace_id"], "cmux workspace ID");
-    try {
-      const surfaceId = requireUuid(result["surface_id"], "cmux workspace surface ID");
-      const windowId = requireMatchingUuid(result["window_id"], "cmux workspace window ID", context.windowId);
-      const listed = await this.rpc(context, "surface.list", { workspace_id: workspaceId });
-      const surface = requireArray(listed["surfaces"], "cmux surfaces").find((candidate) => {
-        return isRecord(candidate)
-          && typeof candidate["id"] === "string"
-          && uuidsEqual(candidate["id"], surfaceId);
-      });
-      if (!isRecord(surface)) throw new Error("cmux did not list the created surface");
-      return {
-        host: "cmux",
-        windowId,
-        workspaceId,
-        paneId: requireUuid(surface["pane_id"], "cmux workspace pane ID"),
-        surfaceId,
-        socketPath: context.socketPath,
-        closeKind: "workspace",
-      };
-    } catch (error) {
-      return this.rollbackAfterFailure(
-        context,
-        "workspace.close",
-        { workspace_id: workspaceId },
-        error,
-      );
-    }
-  }
-
-  private launchInDedicatedWorkspace(
-    context: CmuxContext,
-    spec: HostLaunch,
-    surfaceCommand: string,
-    workspaceCommand: string,
-  ): Promise<CmuxHostTarget> {
-    return this.withTopologyLock(context, async () => {
-      const managedWorkspace = this.managedWorkspace(context);
-      const workspaceId = managedWorkspace.workspaceId;
-      if (workspaceId) {
-        try {
-          const surfaces = await this.listSurfaces(context, workspaceId);
-          const first = surfaces[0];
-          if (first) {
-            return await this.createSurface(
-              context,
-              workspaceId,
-              requireUuid(first["pane_id"], "cmux dedicated workspace pane ID"),
-              spec,
-              surfaceCommand,
-              true,
-            );
-          }
-          try {
-            await this.rpc(context, "workspace.close", { workspace_id: workspaceId });
-          } catch (error) {
-            if (!isNotFound(error)) {
-              throw new Error(
-                `cmux could not close the empty dedicated workspace before recreation: ${errorMessage(error)}`,
-              );
-            }
-          }
-          managedWorkspace.workspaceId = undefined;
-        } catch (error) {
-          if (!isNotFound(error)) throw error;
-          managedWorkspace.workspaceId = undefined;
-        }
-      }
-      return this.createDedicatedWorkspace(context, spec, workspaceCommand);
-    });
-  }
-
-  private async createDedicatedWorkspace(
-    context: CmuxContext,
-    spec: HostLaunch,
-    initialCommand: string,
-  ): Promise<CmuxHostTarget> {
-    const target = await this.createWorkspace(
-      context,
-      { ...spec, title: DEDICATED_WORKSPACE_TITLE },
-      initialCommand,
-    );
-    this.managedWorkspace(context).workspaceId = target.workspaceId;
-    return { ...target, closeKind: "surface", dedicatedWorkspace: true };
-  }
-
   private async createSurface(
     context: CmuxContext,
     workspaceId: string,
     paneId: string,
     spec: HostLaunch,
     initialCommand: string,
-    dedicatedWorkspace: boolean,
   ): Promise<CmuxHostTarget> {
     const result = await this.rpc(context, "surface.create", {
       workspace_id: workspaceId,
@@ -331,7 +226,7 @@ export class Cmux implements TerminalHost {
     });
     const surfaceId = requireUuid(result["surface_id"], "cmux surface ID");
     try {
-      return {
+      const target: CmuxHostTarget = {
         host: "cmux",
         windowId: requireMatchingUuid(result["window_id"], "cmux surface window ID", context.windowId),
         workspaceId: requireMatchingUuid(result["workspace_id"], "cmux surface workspace ID", workspaceId),
@@ -339,8 +234,9 @@ export class Cmux implements TerminalHost {
         surfaceId,
         socketPath: context.socketPath,
         closeKind: "surface",
-        ...(dedicatedWorkspace ? { dedicatedWorkspace: true } : {}),
       };
+      await this.renameSurface(context, target, spec.title);
+      return target;
     } catch (error) {
       return this.rollbackAfterFailure(
         context,
@@ -349,6 +245,19 @@ export class Cmux implements TerminalHost {
         error,
       );
     }
+  }
+
+  private async renameSurface(
+    context: CmuxContext,
+    target: CmuxHostTarget,
+    title: string,
+  ): Promise<void> {
+    await this.rpc(context, "tab.action", {
+      workspace_id: target.workspaceId,
+      surface_id: target.surfaceId,
+      action: "rename",
+      title,
+    });
   }
 
   private async rollbackAfterFailure(
@@ -376,10 +285,7 @@ export class Cmux implements TerminalHost {
       try {
         surfaces = await this.listSurfaces(context, target.workspaceId);
       } catch (error) {
-        if (isNotFound(error)) {
-          this.clearManagedWorkspace(context, target.workspaceId);
-          return;
-        }
+        if (isNotFound(error)) return;
         throw error;
       }
       if (surfaces.length === 0) {
@@ -388,7 +294,6 @@ export class Cmux implements TerminalHost {
         } catch (error) {
           if (!isNotFound(error)) throw error;
         }
-        this.clearManagedWorkspace(context, target.workspaceId);
         return;
       }
       if (!surfaces.some((surface) => {
@@ -400,7 +305,6 @@ export class Cmux implements TerminalHost {
         } catch (error) {
           if (!isNotFound(error)) throw error;
         }
-        this.clearManagedWorkspace(context, target.workspaceId);
         return;
       }
       try {
@@ -497,13 +401,6 @@ export class Cmux implements TerminalHost {
     return managedWorkspaceFor(this.executor, context);
   }
 
-  private clearManagedWorkspace(context: CmuxContext, workspaceId: string): void {
-    const managedWorkspace = this.managedWorkspace(context);
-    if (managedWorkspace.workspaceId && uuidsEqual(managedWorkspace.workspaceId, workspaceId)) {
-      managedWorkspace.workspaceId = undefined;
-    }
-  }
-
   private contextForTarget(target: CmuxHostTarget): CmuxContext {
     const current = this.context;
     return {
@@ -531,7 +428,7 @@ function managedWorkspaceFor(executor: CommandExecutor, context: CmuxContext): M
   const key = `${context.cliPath}\0${context.socketPath}\0${context.windowId.toLowerCase()}`;
   let managedWorkspace = byContext.get(key);
   if (!managedWorkspace) {
-    managedWorkspace = { workspaceId: undefined, topologyOperation: Promise.resolve() };
+    managedWorkspace = { topologyOperation: Promise.resolve() };
     byContext.set(key, managedWorkspace);
   }
   return managedWorkspace;

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +19,7 @@ const CREATED_WORKSPACE = "55555555-5555-4555-8555-55555555555a";
 const CREATED_PANE = "66666666-6666-4666-8666-666666666666";
 const CREATED_SURFACE = "77777777-7777-4777-8777-77777777777b";
 const SECOND_SURFACE = "88888888-8888-4888-8888-888888888888";
+const THIRD_SURFACE = "99999999-9999-4999-8999-999999999998";
 const SOCKET = "/tmp/cmux.sock";
 
 class FakeExecutor implements CommandExecutor {
@@ -33,6 +35,7 @@ class FakeExecutor implements CommandExecutor {
   failingMethod?: string;
   failingMethodMessage = "not_found: target does not exist";
   missingSurfaces = false;
+  createdSurfaceIndex = 0;
 
   async exec(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
     this.calls.push({ command, args });
@@ -66,7 +69,11 @@ class FakeExecutor implements CommandExecutor {
       if (sameUuid(workspaceId, CREATED_WORKSPACE) && !this.dedicatedExists) {
         throw new Error("not_found: workspace does not exist");
       }
-      const surface = { id: SECOND_SURFACE, pane_id: sameUuid(workspaceId, WORKSPACE) ? PANE : CREATED_PANE };
+      const surfaceIds = [SECOND_SURFACE, THIRD_SURFACE];
+      const surface = {
+        id: surfaceIds[this.createdSurfaceIndex++] ?? randomUUID(),
+        pane_id: sameUuid(workspaceId, WORKSPACE) ? PANE : CREATED_PANE,
+      };
       if (sameUuid(workspaceId, CREATED_WORKSPACE)) this.dedicatedSurfaces.push(surface);
       else this.callerSurfaces.push(surface);
       return this.rpcResult(method, {
@@ -98,6 +105,7 @@ class FakeExecutor implements CommandExecutor {
         ? [{ id: CREATED_WORKSPACE, title: "Heishi subagents" }]
         : [],
     });
+    if (method === "tab.action") return json({});
     if (method === "surface.close") {
       const surfaceId = params["surface_id"];
       this.dedicatedSurfaces = this.dedicatedSurfaces.filter((surface) => surface["id"] !== surfaceId);
@@ -146,7 +154,7 @@ describe("cmux terminal host", () => {
     executor.methods = executor.methods.filter((method) => method !== "surface.create");
     await assert.rejects(() => configured.validate(), /missing required methods: surface.create/u);
 
-    for (const method of ["workspace.group.list", "workspace.group.delete"] as const) {
+    for (const method of ["tab.action", "workspace.group.list", "workspace.group.delete"] as const) {
       executor.methods = requiredMethods().filter((candidate) => candidate !== method);
       await assert.rejects(() => configured.validate(), new RegExp(`missing required methods: ${method}`, "u"));
     }
@@ -187,6 +195,12 @@ describe("cmux terminal host", () => {
       assert.match(script, /CMUX_PI_HOOKS_DISABLED='1'/u);
       assert.match(script, /HEISHI_TOKEN='secret-token'/u);
       assert.match(script, /exec 'pi' '--model' 'provider\/model'/u);
+      assert.deepEqual(rpcParams(rpcCall(executor, "tab.action")), {
+        workspace_id: WORKSPACE,
+        surface_id: CREATED_SURFACE,
+        action: "rename",
+        title: "Circe",
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -229,130 +243,18 @@ describe("cmux terminal host", () => {
       assert.equal(params["focus"], false);
       assert.doesNotMatch(String(params["initial_command"]), /^exec /u);
       assert.equal(rpcCallCount(executor, "workspace.create"), 0);
+      assert.deepEqual(rpcParams(rpcCall(executor, "tab.action")), {
+        workspace_id: WORKSPACE,
+        surface_id: SECOND_SURFACE,
+        action: "rename",
+        title: "Circe",
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  it("creates one dedicated workspace for session surfaces and closes it after the last worker", async () => {
-    const executor = new FakeExecutor();
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      const first = await cmux.launch(launch(directory, "session"));
-      const second = await cmux.launch(launch(directory, "session"));
-      assert.equal(first.dedicatedWorkspace, true);
-      assert.equal(second.dedicatedWorkspace, true);
-      assert.equal(first.workspaceId, CREATED_WORKSPACE);
-      assert.equal(second.workspaceId, CREATED_WORKSPACE);
-      assert.equal(rpcCallCount(executor, "workspace.create"), 1);
-      assert.equal(rpcCallCount(executor, "surface.create"), 1);
-
-      await cmux.close(first);
-      assert.equal(executor.dedicatedExists, true);
-      await cmux.close(second);
-      assert.equal(executor.dedicatedExists, false);
-      assert.equal(rpcCallCount(executor, "workspace.close"), 1);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("reuses managed workspace identity across adapters with the same executor and context", async () => {
-    const executor = new FakeExecutor();
-    const firstHost = host(executor);
-    const secondHost = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await firstHost.validate();
-      await secondHost.validate();
-      const first = await firstHost.launch(launch(directory, "session"));
-      const second = await secondHost.launch(launch(directory, "session"));
-      assert.equal(first.workspaceId, second.workspaceId);
-      assert.equal(rpcCallCount(executor, "workspace.create"), 1);
-      assert.equal(rpcCallCount(executor, "surface.create"), 1);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("clears stale managed workspace identity and recreates it", async () => {
-    const executor = new FakeExecutor();
-    const firstHost = host(executor);
-    const secondHost = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await firstHost.validate();
-      await firstHost.launch(launch(directory, "session"));
-      executor.dedicatedExists = false;
-      executor.dedicatedSurfaces = [];
-      await secondHost.validate();
-      await secondHost.launch(launch(directory, "session"));
-      assert.equal(rpcCallCount(executor, "workspace.create"), 2);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("replaces a remembered dedicated workspace when it has no surfaces", async () => {
-    const executor = new FakeExecutor();
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await cmux.launch(launch(directory, "session"));
-      executor.dedicatedSurfaces = [];
-
-      const replacement = await cmux.launch(launch(directory, "session"));
-
-      assert.equal(replacement.workspaceId, CREATED_WORKSPACE);
-      assert.equal(executor.dedicatedExists, true);
-      assert.equal(rpcCallCount(executor, "workspace.close"), 1);
-      assert.equal(rpcCallCount(executor, "workspace.create"), 2);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("does not recreate an empty dedicated workspace when closing it fails", async () => {
-    const executor = new FakeExecutor();
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await cmux.launch(launch(directory, "session"));
-      executor.dedicatedSurfaces = [];
-      executor.failingMethod = "workspace.close";
-      executor.failingMethodMessage = "permission denied";
-
-      await assert.rejects(
-        () => cmux.launch(launch(directory, "session")),
-        /could not close the empty dedicated workspace before recreation.*permission denied/u,
-      );
-      assert.equal(rpcCallCount(executor, "workspace.create"), 1);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("does not adopt an unrelated workspace with the same title", async () => {
-    const executor = new FakeExecutor();
-    executor.dedicatedExists = true;
-    executor.dedicatedSurfaces = [{ id: CREATED_SURFACE, pane_id: CREATED_PANE }];
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await cmux.launch(launch(directory, "session"));
-      assert.equal(rpcCallCount(executor, "workspace.create"), 1);
-      assert.equal(rpcCallCount(executor, "surface.create"), 0);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("serializes concurrent first session launches into one dedicated workspace", async () => {
+  it("maps session placement to surface tabs in the caller pane", async () => {
     const executor = new FakeExecutor();
     const cmux = host(executor);
     const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
@@ -362,9 +264,17 @@ describe("cmux terminal host", () => {
         cmux.launch(launch(directory, "session")),
         cmux.launch(launch(directory, "session")),
       ]);
-      assert.equal(new Set(targets.map((target) => target.workspaceId)).size, 1);
-      assert.equal(rpcCallCount(executor, "workspace.create"), 1);
-      assert.equal(rpcCallCount(executor, "surface.create"), 1);
+
+      assert.deepEqual(targets.map((target) => target.workspaceId), [WORKSPACE, WORKSPACE]);
+      assert.deepEqual(targets.map((target) => target.paneId), [PANE, PANE]);
+      assert.deepEqual(
+        targets.map((target) => target.surfaceId).sort(),
+        [SECOND_SURFACE, THIRD_SURFACE].sort(),
+      );
+      assert.equal(targets.some((target) => target.dedicatedWorkspace === true), false);
+      assert.equal(rpcCallCount(executor, "workspace.create"), 0);
+      assert.equal(rpcCallCount(executor, "surface.create"), 2);
+      assert.equal(rpcCallCount(executor, "tab.action"), 2);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -481,6 +391,24 @@ describe("cmux terminal host", () => {
     }
   });
 
+  it("rolls back a created surface when tab naming fails", async () => {
+    const executor = new FakeExecutor();
+    executor.failingMethod = "tab.action";
+    executor.failingMethodMessage = "rename unavailable";
+    const cmux = host(executor);
+    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
+    try {
+      await cmux.validate();
+      await assert.rejects(
+        () => cmux.launch(launch(directory, "window")),
+        /cmux tab\.action failed: rename unavailable/u,
+      );
+      assert.deepEqual(rpcParams(rpcCall(executor, "surface.close")), { surface_id: SECOND_SURFACE });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects mismatched created-surface relationships and rolls back", async () => {
     for (const [field, value, label] of [
       ["window_id", OTHER_WINDOW, "window"],
@@ -501,42 +429,6 @@ describe("cmux terminal host", () => {
       } finally {
         await rm(directory, { recursive: true, force: true });
       }
-    }
-  });
-
-  it("rejects a mismatched workspace window and preserves the mismatch after rollback", async () => {
-    const executor = new FakeExecutor();
-    executor.overriddenField = { method: "workspace.create", field: "window_id", value: OTHER_WINDOW };
-    executor.failingMethod = "workspace.close";
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await assert.rejects(
-        () => cmux.launch(launch(directory, "session")),
-        /cmux workspace window ID does not match/u,
-      );
-      assert.equal(rpcCallCount(executor, "workspace.close"), 1);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("preserves workspace parsing and rollback failures", async () => {
-    const executor = new FakeExecutor();
-    executor.invalidField = { method: "workspace.create", field: "surface_id" };
-    executor.failingMethod = "workspace.close";
-    executor.failingMethodMessage = "permission denied";
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await assert.rejects(
-        () => cmux.launch(launch(directory, "session")),
-        /cmux workspace surface ID is invalid: invalid; cmux rollback via workspace\.close also failed:.*permission denied/u,
-      );
-    } finally {
-      await rm(directory, { recursive: true, force: true });
     }
   });
 
@@ -597,29 +489,6 @@ describe("cmux terminal host", () => {
     assert.deepEqual(rpcParams(rpcCall(executor, "workspace.close")), {
       workspace_id: CREATED_WORKSPACE,
     });
-  });
-
-  it("cleans up a dedicated target with mixed-case UUIDs and clears its managed identity", async () => {
-    const executor = new FakeExecutor();
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      const target = await cmux.launch(launch(directory, "session"));
-
-      await cmux.close({
-        ...target,
-        workspaceId: target.workspaceId.toUpperCase(),
-        surfaceId: target.surfaceId.toUpperCase(),
-      });
-      await cmux.launch(launch(directory, "session"));
-
-      assert.equal(rpcCallCount(executor, "workspace.close"), 1);
-      assert.equal(rpcCallCount(executor, "workspace.create"), 2);
-      assert.equal(rpcCallCount(executor, "surface.list"), 3);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
   });
 
   it("closes an empty restored dedicated workspace idempotently", async () => {
@@ -704,23 +573,6 @@ describe("cmux terminal host", () => {
     });
   });
 
-  it("treats a not-found final workspace close as success and forgets managed identity", async () => {
-    const executor = new FakeExecutor();
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      const target = await cmux.launch(launch(directory, "session"));
-      executor.failingMethod = "workspace.close";
-      await assert.doesNotReject(() => cmux.close(target));
-      delete executor.failingMethod;
-      await cmux.launch(launch(directory, "session"));
-      assert.equal(rpcCallCount(executor, "workspace.create"), 2);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
   it("treats a not-found legacy group list as already cleaned up", async () => {
     const executor = new FakeExecutor();
     const cmux = host(executor);
@@ -755,36 +607,6 @@ describe("cmux terminal host", () => {
     }), false);
   });
 
-  it("rolls back a workspace when its returned surface ID is malformed", async () => {
-    const executor = new FakeExecutor();
-    executor.invalidField = { method: "workspace.create", field: "surface_id" };
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await assert.rejects(() => cmux.launch(launch(directory, "session")), /surface ID is invalid: invalid/u);
-      assert.deepEqual(rpcParams(rpcCall(executor, "workspace.close")), { workspace_id: CREATED_WORKSPACE });
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects malformed JSON and rolls back a failed dedicated workspace", async () => {
-    const executor = new FakeExecutor();
-    executor.missingSurfaces = true;
-    const cmux = host(executor);
-    const directory = await mkdtemp(join(tmpdir(), "heishi-cmux-test-"));
-    try {
-      await cmux.validate();
-      await assert.rejects(() => cmux.launch(launch(directory, "session")), /did not list the created surface/u);
-      assert.equal(rpcCallCount(executor, "workspace.close"), 1);
-      executor.missingSurfaces = false;
-      executor.malformedMethod = "workspace.create";
-      await assert.rejects(() => cmux.launch(launch(directory, "session")), /malformed JSON/u);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
 });
 
 function host(executor: FakeExecutor): Cmux {
@@ -854,8 +676,8 @@ function requiredMethods(): string[] {
     "surface.list",
     "surface.focus",
     "surface.close",
+    "tab.action",
     "window.focus",
-    "workspace.create",
     "workspace.list",
     "workspace.select",
     "workspace.close",

@@ -150,7 +150,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Main mode loads normal Pi extensions, skills, tools, and prompt templates.",
       ...MAIN_MODEL_GUIDELINES,
       "The `placement` parameter is optional. Omit it unless the user explicitly requests a placement; omission defaults to `session` in sub mode and `window` in main mode.",
-      "In cmux, `window` opens a surface tab in the caller workspace and `session` opens a surface tab in the shared `Heishi subagents` workspace. In tmux, the existing window and named-session mappings remain unchanged.",
+      "In cmux, both `window` and `session` open a surface tab in the caller pane. In tmux, the existing window and named-session mappings remain unchanged.",
       "The optional `workspace` parameter is independent of terminal placement. Main mode uses the effective Heishi workspace when it is omitted; sub mode always uses the shared checkout. An explicit `worktree` is valid only in main mode and isolates repository writes on a retained branch.",
       "For multiple independent delegated tasks, emit multiple `subagent_start` tool calls in the same turn; they run concurrently. Use separate calls rather than combining unrelated work into one task.",
       "Concurrent shared-workspace writers must edit non-overlapping files. Use main-mode worktree workspaces when writers need isolated checkouts.",

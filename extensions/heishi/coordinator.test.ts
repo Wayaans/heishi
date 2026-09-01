@@ -274,6 +274,8 @@ describe("run coordinator", () => {
     assert.equal(started.tmuxSessionId, "$1");
     assert.equal(tmux.launches[0]?.placement, "session");
     assert.equal(tmux.launches[0]?.sessionName, "heishi-subagents");
+    assert.equal(tmux.launches[0]?.title, "sub · Atalanta · 123456");
+    assert.deepEqual(tmux.launches[0]?.command.slice(-2), ["--name", "Subagent: sub · Atalanta · 123456"]);
     assert.deepEqual((ipc.channel).sent[0], {
       type: "task",
       payload: {
@@ -451,6 +453,8 @@ Inspect the repository`,
     assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "main");
     assert.equal(tmux.launches[0]?.placement, "window");
     assert.equal(tmux.launches[0]?.sessionName, undefined);
+    assert.equal(tmux.launches[0]?.title, "main · Atalanta · 123456");
+    assert.equal(tmux.launches[0]?.command.includes("Subagent: main · Atalanta · 123456"), true);
     assert.deepEqual(worktrees.prepared, []);
     assert.equal(started.workspace, undefined);
     await coordinator.shutdown();

@@ -101,8 +101,7 @@ describe("Heishi tool prompt metadata", () => {
     }));
     assert.match(start.parameters.properties?.["task"]?.description ?? "", /worker receives no parent conversation/u);
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("`window` opens a surface tab in the caller workspace")
-        && guideline.includes("`session` opens a surface tab in the shared `Heishi subagents` workspace");
+      return guideline.includes("both `window` and `session` open a surface tab in the caller pane");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("classify the task by its intended repository side effects")

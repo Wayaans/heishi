@@ -46,6 +46,8 @@ it("runs the real cmux placement, focus, and cleanup smoke matrix", {
       launcherDirectory,
     })));
     assert.equal(sessionTargets[0]?.workspaceId, sessionTargets[1]?.workspaceId);
+    assert.equal(sessionTargets[0]?.paneId, sessionTargets[1]?.paneId);
+    assert.notEqual(sessionTargets[0]?.surfaceId, sessionTargets[1]?.surfaceId);
     targets.push(...sessionTargets);
     for (const target of sessionTargets) {
       assert.equal(await cmux.exists(target), true);

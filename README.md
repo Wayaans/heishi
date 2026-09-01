@@ -71,10 +71,10 @@ The public placements keep the same names but map to each host differently:
 | Placement | tmux | cmux |
 | --- | --- | --- |
 | `pane` | Detached split pane | Split pane in the caller workspace |
-| `window` | Detached window in the current session | Surface tab in the caller workspace |
-| `session` | Detached window in `heishi-subagents` | Surface tab in the shared `Heishi subagents` workspace |
+| `window` | Detached window in the current session | Surface tab in the caller pane |
+| `session` | Detached window in `heishi-subagents` | Surface tab in the caller pane |
 
-Sub workers default to `session`, so cmux groups them as surface tabs in one dedicated workspace. Heishi closes that workspace after its last managed surface closes. Main workers default to `window`, so cmux opens them as surface tabs in the caller workspace. Cmux workers launch without focus changes. Heishi also disables cmux's Pi lifecycle hooks inside managed workers so Heishi remains responsible for stop, resume, and cleanup.
+Sub workers default to `session` and main workers default to `window`. Cmux maps both placements to surface tabs in the caller pane and launches them without focus changes. Heishi names each worker tab with its mode, alias, and short run ID, for example `sub · Circe · a1b2c3`. Heishi also disables cmux's Pi lifecycle hooks inside managed workers so Heishi remains responsible for stop, resume, and cleanup.
 
 Shared-workspace subagents use the current checkout. Run concurrent shared writers only on separate files; use main-mode worktree workspaces for isolated checkouts.
 

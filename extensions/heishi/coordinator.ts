@@ -464,7 +464,7 @@ export class RunCoordinator {
     resume: boolean,
     host: TerminalHost,
   ): Promise<HostTarget> {
-    const title = `${run.alias} · ${shortId(run.runId)}`;
+    const title = `${run.mode} · ${run.alias} · ${shortId(run.runId)}`;
     const commandOptions = {
       mode: run.mode,
       piPath: this.dependencies.piPath,
