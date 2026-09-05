@@ -1,8 +1,27 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { reportMarkdown, runIdentity } from "./rendering.js";
+import {
+  displayWorktreePath,
+  formatDuration,
+  reportMarkdown,
+  runIdentity,
+} from "./rendering.js";
 
 describe("subagent report rendering", () => {
+  it("shortens managed worktree paths without changing unrelated paths", () => {
+    assert.equal(
+      displayWorktreePath("/Users/ary/.pi/agent/heishi/worktrees/repo-abc/run-id"),
+      "/worktrees/repo-abc/run-id",
+    );
+    assert.equal(displayWorktreePath("/tmp/custom-worktree/run-id"), "/tmp/custom-worktree/run-id");
+  });
+
+  it("formats elapsed durations consistently", () => {
+    assert.equal(formatDuration(9_999), "9s");
+    assert.equal(formatDuration(83_000), "1m 23s");
+    assert.equal(formatDuration(7_440_000), "2h 4m");
+  });
+
   it("renders every substantive report field once as Markdown", () => {
     const markdown = reportMarkdown({
       status: "completed",

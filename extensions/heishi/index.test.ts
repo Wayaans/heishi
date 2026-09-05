@@ -28,10 +28,23 @@ interface RegisteredTool {
     onUpdate: undefined,
     ctx: unknown,
   ) => Promise<unknown>;
+  renderCall?: (
+    args: Record<string, unknown>,
+    theme: unknown,
+    context: {
+      state: Record<string, unknown>;
+      lastComponent?: { render(width: number): string[] };
+      executionStarted: boolean;
+      isPartial: boolean;
+      isError: boolean;
+      invalidate(): void;
+    },
+  ) => { render(width: number): string[] };
   renderResult?: (
     result: { content: Array<{ type: string; text?: string }>; details?: unknown },
     options: unknown,
     theme: unknown,
+    context?: { state: Record<string, unknown> },
   ) => { render(width: number): string[] };
 }
 
@@ -597,6 +610,39 @@ describe("Heishi tool prompt metadata", () => {
     assert.deepEqual(commands, ["heishi", "subagent"]);
   });
 
+  it("renders the live subagent duration after the waiting status", () => {
+    const tools: RegisteredTool[] = [];
+    const pi = {
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI;
+    heishi(pi);
+
+    const renderCall = requireTool(tools, "subagent_wait").renderCall;
+    assert.ok(renderCall);
+    const interval = setInterval(() => {}, 60_000);
+    const state: Record<string, unknown> = { startedAtMs: 0, endedAtMs: 83_000, interval };
+    const rendered = renderCall({
+      runId: "12345678-1234-1234-1234-123456789abc",
+    }, {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    }, {
+      state,
+      executionStarted: true,
+      isPartial: false,
+      isError: false,
+      invalidate() {},
+    }).render(80)[0] ?? "";
+
+    assert.equal(
+      rendered,
+      "◐ subagent_wait · 123456 · waiting for agent_settled · 1m 23s",
+    );
+    assert.equal("interval" in state, false);
+  });
+
   it("renders the run duration at the end of a settled result", () => {
     const tools: RegisteredTool[] = [];
     const pi = {
@@ -621,7 +667,7 @@ describe("Heishi tool prompt metadata", () => {
     }, {}, {
       fg: (_color: string, text: string) => text,
       bold: (text: string) => text,
-    }).render(200).join("\n").trimEnd();
+    }, { state: {} }).render(200).join("\n").trimEnd();
 
     assert.match(rendered, /Duration: 1m 23s$/u);
   });
@@ -673,26 +719,29 @@ describe("Heishi tool prompt metadata", () => {
 
     const renderResult = requireTool(tools, "subagent_start").renderResult;
     assert.ok(renderResult);
+    const details = {
+      runId: "12345678-1234-1234-1234-123456789abc",
+      alias: "Atalanta",
+      status: "running" as const,
+      workspace: "worktree" as const,
+      worktree: {
+        path: "/agent/heishi/worktrees/repo-abc/run-id",
+        branch: "heishi/run-id",
+        baseCommit: "abc123",
+        state: "present" as const,
+      },
+    };
     const rendered = renderResult({
       content: [],
-      details: {
-        runId: "12345678-1234-1234-1234-123456789abc",
-        alias: "Atalanta",
-        status: "running",
-        workspace: "worktree",
-        worktree: {
-          path: "/agent/heishi/worktrees/repo-abc/run-id",
-          branch: "heishi/run-id",
-          baseCommit: "abc123",
-          state: "present",
-        },
-      },
+      details,
     }, {}, {
       fg: (_color: string, text: string) => text,
       bold: (text: string) => text,
     }).render(200).join("\n");
 
-    assert.match(rendered, /Worktree: \/agent\/heishi\/worktrees\/repo-abc\/run-id · heishi\/run-id · base abc123 · present/u);
+    assert.match(rendered, /Worktree: \/worktrees\/repo-abc\/run-id · heishi\/run-id · base abc123 · present/u);
+    assert.doesNotMatch(rendered, /\/agent\/heishi\/worktrees/u);
+    assert.equal(details.worktree.path, "/agent/heishi/worktrees/repo-abc/run-id");
   });
 
   it("renders running location metadata without repeating model and thinking", () => {

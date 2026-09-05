@@ -1,5 +1,19 @@
 import type { RunResult, SubagentReport } from "./types.js";
 
+export function displayWorktreePath(path: string): string {
+  const marker = "/worktrees/";
+  const markerIndex = path.indexOf(marker);
+  return markerIndex === -1 ? path : path.slice(markerIndex);
+}
+
+export function formatDuration(durationMs: number): string {
+  const seconds = Math.max(0, Math.floor(durationMs / 1000));
+  const minutes = Math.floor(seconds / 60);
+  if (seconds < 60) return `${seconds}s`;
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
 export function reportMarkdown(report: SubagentReport): string {
   const verification = report.verification?.trim() || "Not provided.";
   const remainingRisk = report.remainingRisk?.trim() || "None reported.";

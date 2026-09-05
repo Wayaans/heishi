@@ -9,7 +9,14 @@ import {
   type ExtensionContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import {
+  Container,
+  Markdown,
+  Spacer,
+  Text,
+  truncateToWidth,
+  type Component,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { WorktreeCleanupApproval } from "./cleanup.js";
 import { Cmux } from "./cmux.js";
@@ -30,7 +37,13 @@ import {
   restoreRunSnapshots,
   RUN_ENTRY_TYPE,
 } from "./registry.js";
-import { reportMarkdown, runIdentity, shortRunId } from "./rendering.js";
+import {
+  displayWorktreePath,
+  formatDuration,
+  reportMarkdown,
+  runIdentity,
+  shortRunId,
+} from "./rendering.js";
 import { TerminalHostResolver } from "./terminal-host-resolver.js";
 import { THINKING_LEVELS } from "./terminal-host.js";
 import { Tmux, TmuxHost } from "./tmux.js";
@@ -297,15 +310,28 @@ export default function heishi(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, signal) {
       return toolResult(await requireCoordinator().wait(params.runId, signal));
     },
-    renderCall(args, theme) {
-      const runId = typeof args.runId === "string" ? shortRunId(args.runId) : "…";
-      return new Text(
-        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_wait"))}${theme.fg("dim", ` · ${runId} · waiting for agent_settled`)}`,
-        0,
-        0,
-      );
+    renderCall(args, theme, context) {
+      const fullRunId = typeof args.runId === "string" ? args.runId : undefined;
+      const runId = fullRunId ? shortRunId(fullRunId) : "…";
+      const state = context.state as WaitRenderState;
+      if (context.executionStarted && state.startedAtMs === undefined) {
+        const runStartedAt = fullRunId ? runStartedAtMs(coordinator, fullRunId) : undefined;
+        state.startedAtMs = runStartedAt ?? Date.now();
+      }
+      if (context.executionStarted && context.isPartial && state.interval === undefined) {
+        state.interval = setInterval(() => context.invalidate(), 1000);
+      }
+      if (!context.isPartial || context.isError) stopWaitTimer(state);
+
+      const text = `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_wait"))}${theme.fg("dim", ` · ${runId} · waiting for agent_settled`)}`;
+      const component = context.lastComponent instanceof WaitCallComponent
+        ? context.lastComponent
+        : new WaitCallComponent();
+      component.update(text, theme, state.startedAtMs ?? Date.now(), state.endedAtMs);
+      return component;
     },
-    renderResult(result, _options, theme) {
+    renderResult(result, _options, theme, context) {
+      stopWaitTimer(context.state as WaitRenderState);
       const details = result.details as WaitResult | undefined;
       if (!details) return fallbackResult(result);
       const container = new Container();
@@ -314,15 +340,8 @@ export default function heishi(pi: ExtensionAPI): void {
         container.addChild(new Spacer(1));
         container.addChild(new Markdown(reportMarkdown(details.report), 0, 0, getMarkdownTheme()));
       }
-      const seconds = Math.max(0, Math.floor(details.durationMs / 1000));
-      const minutes = Math.floor(seconds / 60);
-      const duration = seconds < 60
-        ? `${seconds}s`
-        : minutes < 60
-          ? `${minutes}m ${seconds % 60}s`
-          : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
       container.addChild(new Spacer(1));
-      container.addChild(new Text(theme.fg("dim", `Duration: ${duration}`), 0, 0));
+      container.addChild(new Text(theme.fg("dim", `Duration: ${formatDuration(details.durationMs)}`), 0, 0));
       return container;
     },
   });
@@ -419,6 +438,49 @@ function heishiArgumentCompletions(prefix: string): Array<{ value: string; label
   return "settings".startsWith(prefix) ? [{ value: "settings", label: "settings" }] : null;
 }
 
+interface WaitRenderState {
+  startedAtMs?: number;
+  endedAtMs?: number;
+  interval?: ReturnType<typeof setInterval>;
+}
+
+class WaitCallComponent implements Component {
+  private text = "";
+  private theme: Theme | undefined;
+  private startedAtMs = 0;
+  private endedAtMs: number | undefined;
+
+  update(text: string, theme: Theme, startedAtMs: number, endedAtMs?: number): void {
+    this.text = text;
+    this.theme = theme;
+    this.startedAtMs = startedAtMs;
+    this.endedAtMs = endedAtMs;
+  }
+
+  render(width: number): string[] {
+    if (width <= 0) return [];
+    const elapsed = formatDuration((this.endedAtMs ?? Date.now()) - this.startedAtMs);
+    const duration = this.theme?.fg("dim", ` · ${elapsed}`) ?? ` · ${elapsed}`;
+    return [truncateToWidth(`${this.text}${duration}`, width)];
+  }
+
+  invalidate(): void {}
+}
+
+function runStartedAtMs(coordinator: RunCoordinator | undefined, runId: string): number | undefined {
+  const startedAt = coordinator?.list().find((run) => run.runId === runId)?.startedAt;
+  if (!startedAt) return undefined;
+  const timestamp = Date.parse(startedAt);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function stopWaitTimer(state: WaitRenderState): void {
+  state.endedAtMs ??= Date.now();
+  if (state.interval === undefined) return;
+  clearInterval(state.interval);
+  delete state.interval;
+}
+
 interface RenderableResult {
   content: Array<{ type: string; text?: string }>;
 }
@@ -462,7 +524,7 @@ function runStatusHeader(result: RunResult, theme: Theme): string {
       : "";
   const worktree = result.workspace === "worktree"
     ? `\n  ${theme.fg("dim", result.worktree
-        ? `Worktree: ${result.worktree.path} · ${result.worktree.branch} · base ${result.worktree.baseCommit} · ${result.worktree.state}`
+        ? `Worktree: ${displayWorktreePath(result.worktree.path)} · ${result.worktree.branch} · base ${result.worktree.baseCommit} · ${result.worktree.state}`
         : "Worktree: not prepared")}`
     : "";
   const metadata = location ? ` · ${location}` : "";
