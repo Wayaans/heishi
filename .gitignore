@@ -5,3 +5,4 @@ node_modules/
 .pi/skills/
 *.log
 .DS_Store
+.pi/
