@@ -760,10 +760,8 @@ function validateStart(input: StartInput): WorkerMode {
   if (!input.task.trim()) throw new Error("Subagent task is required");
   const mode = input.mode ?? "sub";
   if (mode === "main") {
-    if (input.thinking !== undefined && !input.model?.trim()) {
-      throw new Error("Main-agent thinking requires an explicit model");
-    }
-    if (input.model !== undefined && !input.model.trim()) throw new Error("Main-agent model is required");
+    if (!input.model?.trim() || input.thinking === undefined) throw new Error("Main mode requires an explicit model and thinking level");
+    parseThinkingLevel(input.thinking);
     return mode;
   }
   if (!input.model?.trim()) throw new Error("Subagent model is required");

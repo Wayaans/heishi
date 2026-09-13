@@ -339,7 +339,7 @@ Inspect the repository`,
     const { coordinator, tmux, worktrees } = fixture();
     worktrees.prepareError = new Error("Git worktree workspace requires a clean source checkout");
 
-    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const failed = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
 
     assert.equal(failed.status, "failed");
     assert.equal(failed.workspace, "worktree");
@@ -356,7 +356,7 @@ Inspect the repository`,
       removed,
     );
 
-    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const failed = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
 
     assert.equal(failed.status, "failed");
     assert.equal(failed.worktree?.state, "removed");
@@ -371,7 +371,7 @@ Inspect the repository`,
   it("starts a main worker in its prepared worktree and reports workspace metadata", async () => {
     const { coordinator, ipc, tmux, worktrees } = fixture();
 
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement the change" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement the change" });
 
     assert.equal(started.workspace, "worktree");
     assert.deepEqual(started.worktree, {
@@ -392,7 +392,7 @@ Inspect the repository`,
     ipc.failOpen = true;
     worktrees.rollbackWarning = "Worktree branch and internal lease were retained for manual recovery";
 
-    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const failed = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
 
     assert.equal(failed.status, "failed");
     assert.equal(failed.worktree?.state, "removed");
@@ -406,7 +406,7 @@ Inspect the repository`,
     ipc.failOpen = true;
     worktrees.rollbackError = new Error("could not remove registered worktree");
 
-    const failed = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const failed = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
 
     assert.equal(failed.worktree?.state, "present");
     assert.match(failed.error ?? "", /rollback was refused.*could not remove/u);
@@ -416,7 +416,7 @@ Inspect the repository`,
   it("rolls back a prepared worktree only when startup fails before launch", async () => {
     const beforeLaunch = fixture();
     beforeLaunch.ipc.failOpen = true;
-    const failed = await beforeLaunch.coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const failed = await beforeLaunch.coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     assert.equal(failed.status, "failed");
     assert.equal(failed.worktree?.state, "removed");
     assert.equal(beforeLaunch.worktrees.rolledBack.length, 1);
@@ -429,6 +429,7 @@ Inspect the repository`,
     const afterLaunch = fixture({ model: "provider/unexpected" });
     const launched = await afterLaunch.coordinator.start({
       mode: "main",
+      thinking: "high",
       workspace: "worktree",
       task: "Implement",
       model: "provider/requested",
@@ -438,10 +439,23 @@ Inspect the repository`,
     assert.deepEqual(afterLaunch.worktrees.rolledBack, []);
   });
 
-  it("starts main mode with Pi defaults in the shared workspace", async () => {
+  it("requires both main model and thinking before preparing or launching a worker", async () => {
+    const { coordinator, tmux, worktrees } = fixture();
+    for (const pair of [{}, { model: "provider/requested" }, { thinking: "high" as const }]) {
+      await assert.rejects(
+        () => coordinator.start({ mode: "main", workspace: "worktree", task: "Implement", ...pair }),
+        /Main mode requires an explicit model and thinking level/u,
+      );
+    }
+    assert.deepEqual(tmux.launches, []);
+    assert.deepEqual(worktrees.prepared, []);
+    await coordinator.shutdown();
+  });
+
+  it("starts main mode with an explicit saved-default pair in the shared workspace", async () => {
     const { coordinator, ipc, tmux, worktrees } = fixture({ model: "provider/default", thinking: "medium" });
 
-    const started = await coordinator.start({ mode: "main", task: "Inspect the repository" });
+    const started = await coordinator.start({ mode: "main", model: "provider/default", thinking: "medium", task: "Inspect the repository" });
 
     assert.equal(started.mode, "main");
     assert.equal(started.model, "provider/default");
@@ -449,7 +463,8 @@ Inspect the repository`,
     assert.deepEqual(ipc.channel.readinessTimeouts, [60_000]);
     assert.equal(tmux.launches[0]?.command.includes("--no-extensions"), false);
     assert.equal(tmux.launches[0]?.command.includes("--approve"), true);
-    assert.equal(tmux.launches[0]?.command.includes("--model"), false);
+    assert.equal(tmux.launches[0]?.command.includes("--model"), true);
+    assert.equal(tmux.launches[0]?.command.includes("--thinking"), true);
     assert.equal(tmux.launches[0]?.environment["HEISHI_WORKER_MODE"], "main");
     assert.equal(tmux.launches[0]?.placement, "window");
     assert.equal(tmux.launches[0]?.sessionName, undefined);
@@ -502,7 +517,7 @@ Inspect the repository`,
 
   it("uses structured reports and final-text fallback in main mode", async () => {
     const structured = fixture();
-    const first = await structured.coordinator.start({ mode: "main", task: "Inspect" });
+    const first = await structured.coordinator.start({ mode: "main", model: "openai/model", thinking: "high", task: "Inspect" });
     await structured.ipc.emit({
       type: "report",
       runId: first.runId,
@@ -515,17 +530,18 @@ Inspect the repository`,
     assert.equal(structuredResult.report?.structured, true);
 
     const fallback = fixture();
-    const second = await fallback.coordinator.start({ mode: "main", task: "Inspect" });
+    const second = await fallback.coordinator.start({ mode: "main", model: "openai/model", thinking: "high", task: "Inspect" });
     await fallback.ipc.emit({ type: "settled", runId: second.runId, version: 1, finalText: "Main fallback" });
     const fallbackResult = await fallback.coordinator.wait(second.runId);
     assert.equal(fallbackResult.report?.summary, "Main fallback");
     assert.equal(fallbackResult.report?.structured, false);
   });
 
-  it("verifies only the main launch overrides that were supplied", async () => {
+  it("verifies explicit main model and thinking overrides", async () => {
     const accepted = fixture({ model: "provider/requested", thinking: "low" });
     const started = await accepted.coordinator.start({
       mode: "main",
+      thinking: "low",
       task: "Inspect",
       model: "provider/requested",
     });
@@ -536,6 +552,7 @@ Inspect the repository`,
     const rejected = fixture({ model: "provider/fallback" });
     const failed = await rejected.coordinator.start({
       mode: "main",
+      thinking: "high",
       task: "Inspect",
       model: "provider/requested",
     });
@@ -543,13 +560,32 @@ Inspect the repository`,
     assert.match(failed.error ?? "", /requested model provider\/requested.*provider\/fallback/u);
   });
 
-  it("rejects main thinking without an explicit model", async () => {
-    const { coordinator } = fixture();
+  it("passes the explicit main pair to Pi without relying on launch defaults", async () => {
+    const { coordinator, ipc, tmux } = fixture({ model: "provider/default", thinking: "high" });
 
-    await assert.rejects(
-      () => coordinator.start({ mode: "main", task: "Inspect", thinking: "high" }),
-      /requires an explicit model/u,
-    );
+    const started = await coordinator.start({ mode: "main", task: "Implement", model: "provider/default", thinking: "high" });
+
+    assert.equal(started.status, "running");
+    assert.equal(started.model, "provider/default");
+    assert.equal(started.thinking, "high");
+    const command = tmux.launches[0]?.command ?? [];
+    assert.equal(command[command.indexOf("--model") + 1], "provider/default");
+    assert.equal(command[command.indexOf("--thinking") + 1], "high");
+    assert.equal(ipc.channel.sent[0]?.type, "task");
+    await coordinator.shutdown();
+  });
+
+  it("fails before task submission when Pi clamps the explicit thinking level", async () => {
+    const { coordinator, ipc, tmux } = fixture({ model: "provider/plain", thinking: "off" });
+
+    const started = await coordinator.start({ mode: "main", task: "Implement", model: "provider/plain", thinking: "high" });
+
+    assert.equal(started.status, "failed");
+    assert.match(started.error ?? "", /requested thinking high, but Pi started off/u);
+    assert.deepEqual(ipc.channel.sent, []);
+    assert.equal(ipc.channel.closed, true);
+    assert.deepEqual(tmux.closed, ["%9"]);
+    await coordinator.shutdown();
   });
 
   it("preserves rollback warnings and refusals when startup is cancelled before launch", async () => {
@@ -559,7 +595,7 @@ Inspect the repository`,
     warningFixture.worktrees.prepareGate = new Promise<void>((resolve) => { releaseWarningPrepare = resolve; });
     warningFixture.worktrees.rollbackWarning = "branch ownership changed and the branch was retained";
     const warningStart = warningFixture.coordinator.start(
-      { mode: "main", workspace: "worktree", task: "Implement" },
+      { mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" },
       warningController.signal,
     );
     while (warningFixture.worktrees.prepared.length === 0) await pause();
@@ -578,7 +614,7 @@ Inspect the repository`,
     refusalFixture.worktrees.prepareGate = new Promise<void>((resolve) => { releaseRefusalPrepare = resolve; });
     refusalFixture.worktrees.rollbackError = new Error("registered worktree could not be removed");
     const refusalStart = refusalFixture.coordinator.start(
-      { mode: "main", workspace: "worktree", task: "Implement" },
+      { mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" },
       refusalController.signal,
     );
     while (refusalFixture.worktrees.prepared.length === 0) await pause();
@@ -643,7 +679,7 @@ Inspect the repository`,
     const { coordinator, ipc, tmux, worktrees } = fixture();
     let releasePrepare!: () => void;
     worktrees.prepareGate = new Promise<void>((resolve) => { releasePrepare = resolve; });
-    const starting = coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const starting = coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     const startRejected = assert.rejects(starting, /Subagent start was cancelled/u);
     while (worktrees.prepared.length === 0) await pause();
 
@@ -749,6 +785,8 @@ Inspect the repository`,
 
     await coordinator.start({
       mode: "main",
+      model: "openai/model",
+      thinking: "high",
       task: "Inspect in the background",
       placement: "session",
     });
@@ -839,7 +877,7 @@ Inspect the repository`,
 
   it("validates cleanup before prompting and repeats worktree checks during cleanup", async () => {
     const { coordinator, ipc, worktrees } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
 
     await assert.rejects(
       () => coordinator.validateCleanup(started.runId),
@@ -858,7 +896,7 @@ Inspect the repository`,
 
   it("excludes cleanup and resume while cleanup validation is in progress", async () => {
     const { coordinator, ipc, worktrees } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
     let releaseValidation!: () => void;
     worktrees.cleanupValidationGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
@@ -880,7 +918,7 @@ Inspect the repository`,
 
   it("rejects dirty cleanup during non-mutating validation", async () => {
     const { coordinator, ipc, worktrees } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
     worktrees.cleanupValidationError = new Error("Worktree has modified, untracked, or ignored files; cleanup refused");
 
@@ -890,7 +928,7 @@ Inspect the repository`,
 
   it("persists removed metadata and error when cleanup detects inconsistent retained refs", async () => {
     const { coordinator, ipc, worktrees, records } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
     const removed = removedWorktree(worktrees.record, "cleanup-commit");
     worktrees.cleanupError = new WorktreeOperationError(
@@ -911,7 +949,7 @@ Inspect the repository`,
 
   it("rejects cleanup and resume while auto-close finalization is still tearing down runtime resources", async () => {
     const { coordinator, ipc, tmux } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     let releaseClose!: () => void;
     tmux.closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
 
@@ -935,7 +973,7 @@ Inspect the repository`,
 
   it("keeps cleanup blocked when pane close verification finds the pane still present", async () => {
     const { coordinator, ipc, tmux } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     tmux.closeLeavesTarget = true;
 
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
@@ -952,7 +990,7 @@ Inspect the repository`,
 
   it("keeps cleanup blocked when pane close verification fails", async () => {
     const { coordinator, ipc, tmux } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     tmux.existsError = new Error("tmux server unavailable");
 
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
@@ -972,6 +1010,7 @@ Inspect the repository`,
 
     const failed = await coordinator.start({
       mode: "main",
+      thinking: "high",
       workspace: "worktree",
       task: "Implement",
       model: "provider/requested",
@@ -988,7 +1027,7 @@ Inspect the repository`,
 
   it("persists ambiguous worktree state when resume rollback fails", async () => {
     const { coordinator, ipc, worktrees, records } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
     await coordinator.control({ runId: started.runId, action: "cleanup" });
     const removed = coordinator.list()[0]?.worktree;
@@ -1134,7 +1173,7 @@ Inspect the repository`,
 
   it("rejects resume while cleanup is concurrently in progress", async () => {
     const { coordinator, ipc, worktrees } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
     let releaseCleanup!: () => void;
     worktrees.cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
@@ -1152,7 +1191,7 @@ Inspect the repository`,
 
   it("cleans only settled closed worktree runs and recreates them on resume", async () => {
     const { coordinator, ipc, worktrees } = fixture();
-    const started = await coordinator.start({ mode: "main", workspace: "worktree", task: "Implement" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", workspace: "worktree", task: "Implement" });
     await assert.rejects(
       () => coordinator.control({ runId: started.runId, action: "cleanup" }),
       /runtime is still open or finalizing/u,
@@ -1210,7 +1249,7 @@ Inspect the repository`,
 
   it("tracks main model and thinking changes reported by the bridge", async () => {
     const { coordinator, ipc } = fixture();
-    const started = await coordinator.start({ mode: "main", task: "Inspect" });
+    const started = await coordinator.start({ mode: "main", model: "openai/model", thinking: "high", task: "Inspect" });
 
     await ipc.emit({
       type: "metadata",

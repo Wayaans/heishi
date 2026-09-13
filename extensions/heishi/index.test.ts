@@ -44,7 +44,7 @@ interface RegisteredTool {
     result: { content: Array<{ type: string; text?: string }>; details?: unknown },
     options: unknown,
     theme: unknown,
-    context?: { state: Record<string, unknown> },
+    context?: { state: Record<string, unknown>; isError?: boolean },
   ) => { render(width: number): string[] };
 }
 
@@ -139,17 +139,18 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("final report");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("first use any authenticated model or thinking level explicitly requested by the user")
-        && guideline.includes("outside the Heishi delegation pool");
+      return guideline.includes("call `subagent_models`")
+        && guideline.includes("saved worker defaults")
+        && guideline.includes("Pass both `model` and `thinking` explicitly");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("does not explicitly request a main-mode model or thinking level")
-        && guideline.includes("parent session's exact active model and thinking level");
+      return guideline.includes("saved worker model/thinking pair as the main-mode baseline")
+        && guideline.includes("Explicit user requests take priority independently for each field")
+        && guideline.includes("suited to the task");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("delegation pool only as the final fallback")
-        && guideline.includes("parent session's exact model/thinking pair is unavailable")
-        && guideline.includes("best fits the task");
+      return guideline.includes("Do not inherit the parent session's active model or thinking level")
+        && guideline.includes("or use the Heishi delegation pool as a fallback for main mode");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("use `subagent_control` first only when live interaction is needed")
@@ -211,9 +212,9 @@ describe("Heishi tool prompt metadata", () => {
       start.parameters.properties?.["workspace"]?.anyOf?.map((workspace) => workspace.const),
       ["shared", "worktree"],
     );
-    assert.equal(start.parameters.required?.includes("model") ?? false, false);
-    assert.equal(start.parameters.required?.includes("thinking") ?? false, false);
-    assert.deepEqual(tools.map((tool) => tool.name), ["subagent_start", "subagent_control", "subagent_wait"]);
+    assert.equal(start.parameters.required?.includes("model"), true);
+    assert.equal(start.parameters.required?.includes("thinking"), true);
+    assert.deepEqual(tools.map((tool) => tool.name), ["subagent_models", "subagent_start", "subagent_control", "subagent_wait"]);
   });
 
   it("runs cleanup only after interactive confirmation", async () => {
@@ -393,10 +394,14 @@ describe("Heishi tool prompt metadata", () => {
     assert.match(result.systemPrompt, /Use `sub` mode for read-only work/u);
     assert.match(result.systemPrompt, /Use `main` mode for write work/u);
     assert.match(result.systemPrompt, /pass `mode` explicitly/u);
-    assert.match(result.systemPrompt, /first use any authenticated model or thinking level explicitly requested by the user/u);
-    assert.match(result.systemPrompt, /use the parent session's exact active model and thinking level/u);
-    assert.match(result.systemPrompt, /delegation pool only as the final fallback/u);
-    assert.match(result.systemPrompt, /provider\/session-model \/ high/u);
+    assert.match(result.systemPrompt, /call `subagent_models`/u);
+    assert.match(result.systemPrompt, /saved worker model\/thinking pair as the main-mode baseline/u);
+    assert.match(result.systemPrompt, /Pass both `model` and `thinking` explicitly/u);
+    assert.match(result.systemPrompt, /Explicit user requests take priority independently for each field/u);
+    assert.match(result.systemPrompt, /agent declaration, not proof of user authorization/u);
+    assert.match(result.systemPrompt, /Do not inherit the parent session's active model or thinking level/u);
+    assert.match(result.systemPrompt, /Main mode uses subagent_models discovery and requires an explicit model\/thinking pair/u);
+    assert.doesNotMatch(result.systemPrompt, /provider\/session-model|exact active model\/thinking pair|final fallback/u);
   });
 
   it("accepts only the interactive settings command", async () => {
@@ -442,6 +447,32 @@ describe("Heishi tool prompt metadata", () => {
 
     await assert.rejects(
       () => start("call-1", { mode: "main", task: "Inspect" }, undefined, undefined, ctx),
+      /Main mode requires an explicit model and thinking level/u,
+    );
+    await assert.rejects(
+      () => start("call-thinking", { mode: "main", task: "Implement", thinking: "high" }, undefined, undefined, ctx),
+      /Main mode requires an explicit model and thinking level/u,
+    );
+    await assert.rejects(
+      () => start("call-model-only", { mode: "main", task: "Implement", model: "provider/requested" }, undefined, undefined, ctx),
+      /Main mode requires an explicit model and thinking level/u,
+    );
+    const requested = testModel("provider", "requested");
+    const requestedContext = {
+      ...ctx,
+      modelRegistry: { getAvailable: () => [requested], find: () => requested, hasConfiguredAuth: () => true },
+    };
+    const pair = { mode: "main", task: "Implement", model: "provider/requested", thinking: "high" };
+    await assert.rejects(
+      () => start("call-pair", pair, undefined, undefined, requestedContext),
+      /No authenticated models in the current session scope/u,
+    );
+    await assert.rejects(
+      () => start("call-user-pair", { ...pair, userRequestedModel: true }, undefined, undefined, requestedContext),
+      /coordinator is not initialized/u,
+    );
+    await assert.rejects(
+      () => start("call-scoped-pair", pair, undefined, undefined, { ...requestedContext, scopedModels: [{ model: requested }] }),
       /coordinator is not initialized/u,
     );
     await assert.rejects(
@@ -452,6 +483,67 @@ describe("Heishi tool prompt metadata", () => {
       () => start("call-3", { mode: "sub", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
       /delegation models are not configured/u,
     );
+  });
+
+  it("discovers scoped choices and saved defaults without copying the parent's active pair", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-discovery-"));
+    try {
+      await mkdir(join(root, CONFIG_DIR_NAME));
+      await writeFile(join(root, CONFIG_DIR_NAME, "settings.json"), JSON.stringify({
+        defaultProvider: "provider", defaultModel: "saved", defaultThinkingLevel: "medium",
+        modelThinkingLevels: { "provider/saved": "low" },
+      }));
+      const tools: RegisteredTool[] = [];
+      heishi({
+        on() {}, registerCommand() {},
+        registerTool(tool: RegisteredTool) { tools.push(tool); },
+      } as unknown as ExtensionAPI);
+      const discover = requireTool(tools, "subagent_models").execute;
+      assert.ok(discover);
+      const saved = testModel("provider", "saved");
+      const active = testModel("provider", "active");
+      const requested = testModel("provider", "outside");
+      const ctx = {
+        cwd: root, isProjectTrusted: () => true,
+        model: active, thinkingLevel: "high",
+        scopedModels: [{ model: saved, thinkingLevel: "high" }],
+        modelRegistry: {
+          getAvailable: () => [saved, active, requested],
+          find: (provider: string, id: string) => provider === "provider" && id === "outside" ? requested : undefined,
+          hasConfiguredAuth: () => true,
+        },
+      };
+      const result = JSON.stringify(await discover("models", {}, undefined, undefined, ctx));
+      assert.match(result, /provider\/saved/u);
+      assert.match(result, /"pair":\{"model":"provider\/saved","thinking":"low"\}/u);
+      assert.doesNotMatch(result, /provider\/active|provider\/outside|baseUrl/u);
+      const targeted = JSON.stringify(await discover("requested", { userRequestedModel: "provider/outside" }, undefined, undefined, ctx));
+      assert.match(targeted, /"userRequestedModel":\{"model":"provider\/outside"/u);
+      assert.doesNotMatch(targeted, /provider\/active/u);
+      const empty = JSON.stringify(await discover("empty", {}, undefined, undefined, { ...ctx, scopedModels: [] }));
+      assert.match(empty, /No authenticated models in the current session scope/u);
+      assert.doesNotMatch(empty, /provider\/saved|provider\/active|provider\/outside/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects undeclared out-of-scope choices, unsupported user pairs, and sub exceptions", async () => {
+    const tools: RegisteredTool[] = [];
+    heishi({ on() {}, registerCommand() {}, registerTool(tool: RegisteredTool) { tools.push(tool); } } as unknown as ExtensionAPI);
+    const start = requireTool(tools, "subagent_start").execute;
+    assert.ok(start);
+    const scoped = testModel("provider", "scoped");
+    const plain = { ...testModel("provider", "plain"), reasoning: false };
+    const ctx = {
+      scopedModels: [{ model: scoped }],
+      modelRegistry: { getAvailable: () => [scoped, plain], find: () => plain, hasConfiguredAuth: () => true },
+    };
+    const pair = { mode: "main", task: "Implement", model: "provider/plain", thinking: "high" };
+    await assert.rejects(() => start("outside", pair, undefined, undefined, ctx), /outside the current authenticated session scope/u);
+    await assert.rejects(() => start("false", { ...pair, userRequestedModel: false }, undefined, undefined, ctx), /outside the current authenticated session scope/u);
+    await assert.rejects(() => start("unsupported", { ...pair, userRequestedModel: true }, undefined, undefined, ctx), /does not support thinking high/u);
+    await assert.rejects(() => start("sub", { ...pair, mode: "sub", userRequestedModel: true }, undefined, undefined, ctx), /available only in main mode/u);
   });
 
   it("rejects sub starts outside a non-empty configured pool", async () => {
@@ -494,6 +586,16 @@ describe("Heishi tool prompt metadata", () => {
         ),
         /pair is not allowed/u,
       );
+      const start = requireTool(tools, "subagent_start").execute;
+      assert.ok(start);
+      for (const overrides of [{ model: "provider/allowed" }, { thinking: "high" }]) {
+        await assert.rejects(
+          () => start(
+            "call-missing-pair", { mode: "sub", task: "Inspect", ...overrides }, undefined, undefined, ctx,
+          ),
+          /Sub mode requires an explicit model and thinking level/u,
+        );
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -606,8 +708,102 @@ describe("Heishi tool prompt metadata", () => {
       await rm(socketPath, { force: true });
     }
 
-    assert.deepEqual(tools, ["subagent_start", "subagent_control", "subagent_wait", "subagent_report"]);
+    assert.deepEqual(tools, ["subagent_models", "subagent_start", "subagent_control", "subagent_wait", "subagent_report"]);
     assert.deepEqual(commands, ["heishi", "subagent"]);
+  });
+
+  describe("model discovery rendering", () => {
+    const tools: RegisteredTool[] = [];
+    heishi({
+      on() {}, registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI);
+    const tool = requireTool(tools, "subagent_models");
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const models = [
+      { model: "provider/model-a", thinkingLevels: ["off", "low", "high"] },
+      { model: "provider/model-b", thinkingLevels: ["low", "high"] },
+    ];
+    const details = { defaults: { pair: { model: "provider/model-a", thinking: "high" } }, models };
+    const context = () => ({
+      state: {} as Record<string, unknown>, executionStarted: true, isPartial: false, isError: false,
+      invalidate() {},
+    });
+
+    it("keeps defaults compact and updates the call header with the scoped count", () => {
+      assert.ok(tool.renderCall);
+      assert.ok(tool.renderResult);
+      const ctx = context();
+      const result = { content: [{ type: "text", text: JSON.stringify(details) }], details };
+      const before = JSON.stringify(result);
+      const header = tool.renderCall({}, theme, ctx);
+      assert.equal(header.render(200).join("\n").trimEnd(), "◐ subagent_models · main");
+      const rendered = tool.renderResult(result, { expanded: false }, theme, ctx).render(200).join("\n").trimEnd();
+      assert.equal(rendered, "  Default: provider/model-a / high");
+      assert.equal(header.render(200).join("\n").trimEnd(), "◐ subagent_models · main · 2 scoped models");
+      assert.equal(JSON.stringify(result), before);
+    });
+
+    it("expands stacked model rows and wraps long names in narrow terminals", () => {
+      assert.ok(tool.renderResult);
+      const result = { content: [], details };
+      const component = tool.renderResult(result, { expanded: true }, theme, context());
+      assert.equal(component.render(200).map((line) => line.trimEnd()).join("\n"), [
+        "  Default: provider/model-a / high", "",
+        "  provider/model-a", "    Thinking: off, low, high",
+        "  provider/model-b", "    Thinking: low, high",
+      ].join("\n"));
+      const longName = "provider/a-model-name-that-exceeds-the-terminal-width";
+      const narrow = tool.renderResult({ content: [], details: {
+        ...details, models: [{ model: longName, thinkingLevels: ["high"] }],
+      } }, { expanded: true }, theme, context()).render(24);
+      assert.ok(narrow.every((line) => line.length <= 24));
+      assert.ok(narrow.map((line) => line.trim()).join("").includes(longName));
+    });
+
+    it("shows requested levels while collapsed and marks only out-of-scope requests", () => {
+      assert.ok(tool.renderCall);
+      assert.ok(tool.renderResult);
+      for (const model of ["provider/model-a", "provider/outside"]) {
+        const ctx = context();
+        const requested = { model, thinkingLevels: ["low", "high"] };
+        const rendered = tool.renderResult({ content: [], details: {
+          ...details, userRequestedModel: requested,
+        } }, { expanded: false }, theme, ctx).render(200).join("\n");
+        assert.ok(rendered.includes(`Requested: ${model}`));
+        assert.match(rendered, /Thinking: low, high/u);
+        assert.equal(rendered.includes("outside session scope"), model === "provider/outside");
+        const header = tool.renderCall({ userRequestedModel: model }, theme, ctx).render(200).join("\n");
+        assert.ok(header.includes(`requested ${model}`));
+        assert.match(header, /2 scoped models/u);
+      }
+    });
+
+    it("keeps default warnings visible with empty scope or valid model choices", () => {
+      assert.ok(tool.renderCall);
+      assert.ok(tool.renderResult);
+      const styledTheme = { ...theme, fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
+      for (const choices of [[], models.slice(0, 1)]) {
+        const ctx = context();
+        const result = { content: [], details: { defaults: { error: "Saved default is unavailable" }, models: choices } };
+        const collapsed = tool.renderResult(result, { expanded: false }, styledTheme, ctx).render(200).join("\n");
+        assert.match(collapsed, /<warning>Default unavailable: Saved default is unavailable<\/warning>/u);
+        const header = tool.renderCall({}, theme, ctx).render(200).join("\n").trimEnd();
+        assert.ok(header.endsWith(choices.length === 0 ? "0 scoped models" : "1 scoped model"));
+        const expanded = tool.renderResult(result, { expanded: true }, theme, ctx).render(200).join("\n");
+        assert.equal(expanded.includes("provider/model-a"), choices.length > 0);
+      }
+    });
+
+    it("renders lookup failures in error color and preserves text-only fallback results", () => {
+      assert.ok(tool.renderResult);
+      const result = { content: [{ type: "text", text: "User-requested main model is not authenticated: provider/missing" }] };
+      const styledTheme = { ...theme, fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
+      const failed = tool.renderResult(result, { expanded: false }, styledTheme, { ...context(), isError: true }).render(200).join("\n");
+      assert.match(failed, /<error>User-requested main model is not authenticated: provider\/missing<\/error>/u);
+      const fallback = tool.renderResult(result, { expanded: false }, theme, context()).render(200).join("\n").trimEnd();
+      assert.equal(fallback, result.content[0]?.text);
+    });
   });
 
   it("renders the live subagent duration after the waiting status", () => {
@@ -744,7 +940,26 @@ describe("Heishi tool prompt metadata", () => {
     assert.equal(details.worktree.path, "/agent/heishi/worktrees/repo-abc/run-id");
   });
 
-  it("renders running location metadata without repeating model and thinking", () => {
+  it("renders the explicit main model instead of a configured-default placeholder", () => {
+    const tools: RegisteredTool[] = [];
+    heishi({
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+    } as unknown as ExtensionAPI);
+    const renderCall = requireTool(tools, "subagent_start").renderCall;
+    assert.ok(renderCall);
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    };
+    const context = { state: {}, executionStarted: true, isPartial: false, isError: false, invalidate() {} };
+    assert.doesNotMatch(renderCall({ mode: "main", thinking: "high" }, theme, context).render(200).join("\n"), /configured default/u);
+    assert.match(renderCall({ mode: "main", model: "provider/requested", thinking: "low" }, theme, context).render(200).join("\n"), /provider\/requested \/ low/u);
+    assert.doesNotMatch(renderCall({ mode: "sub", thinking: "high" }, theme, context).render(200).join("\n"), /configured default/u);
+  });
+
+  it("renders running location metadata and the resolved model and thinking", () => {
     const tools: RegisteredTool[] = [];
     const pi = {
       on() {},
@@ -776,7 +991,7 @@ describe("Heishi tool prompt metadata", () => {
 
     assert.match(rendered, /^→ Atalanta · 123456  running/u);
     assert.match(rendered, /tmux · pane %9 · window @2 · session \$1/u);
-    assert.doesNotMatch(rendered, /openai\/model|high/u);
+    assert.match(rendered, /Started with: openai\/model \/ high/u);
   });
 });
 

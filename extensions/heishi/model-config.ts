@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import type { ScopedModel } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, type ModelRegistry, type ScopedModel } from "@earendil-works/pi-coding-agent";
 import { THINKING_LEVELS, type TerminalHostPreference, type ThinkingLevel } from "./terminal-host.js";
 import type { WorkerMode, WorkspaceKind } from "./types.js";
 
@@ -139,17 +139,65 @@ export function modelReference(model: Pick<Model<any>, "provider" | "id">): stri
   return `${model.provider}/${model.id}`;
 }
 
-export function validateMainOverrides(
+export function mainModelChoices(
+  availableModels: readonly ModelChoice["model"][],
+  scopedModels: readonly ScopedModel[],
+): ModelChoice[] {
+  // Main selection uses scope membership, not cycling's optional thinking pins.
+  const references = new Set(scopedModels.map(({ model }) => modelReference(model)));
+  return availableModelChoices(availableModels.filter((model) => references.has(modelReference(model))), []);
+}
+
+export function savedMainDefaults(
+  cwd: string,
+  agentDir: string,
+  projectTrusted: boolean,
+  choices: readonly ModelChoice[],
+): { pair: DelegationPair } | { error: string } {
+  const settings = SettingsManager.create(cwd, agentDir, { projectTrusted });
+  if (settings.drainErrors().length > 0) return { error: "Cannot read saved worker model settings" };
+  if (choices.length === 0) return { error: "No authenticated models in the current session scope; ordinary main selection is unavailable" };
+  const provider = settings.getDefaultProvider();
+  const id = settings.getDefaultModel();
+  if (!provider || !id) return { error: "Saved worker default provider/model is not configured" };
+  const model = `${provider}/${id}`;
+  const choice = choices.find((candidate) => modelReference(candidate.model) === model);
+  if (!choice) return { error: "Saved worker default model is not in the current authenticated session scope" };
+
+  // Newer Pi versions support per-model defaults. Read their data without requiring a newer SDK getter.
+  let thinking: unknown = settings.getDefaultThinkingLevel();
+  for (const source of [settings.getGlobalSettings(), ...(projectTrusted ? [settings.getProjectSettings()] : [])]) {
+    if (!("modelThinkingLevels" in source)) continue;
+    const levels = source.modelThinkingLevels;
+    if (!isRecord(levels)) return { error: "Saved worker per-model thinking settings are invalid" };
+    if (model in levels) thinking = levels[model];
+  }
+  if (!isThinkingLevel(thinking)) return { error: "Saved worker default thinking level is missing or invalid" };
+  if (!choice.levels.includes(thinking)) return { error: "Saved worker default thinking level is unsupported by its model" };
+  return { pair: { model, thinking } };
+}
+
+export function userRequestedModelChoice(reference: string, registry: Pick<ModelRegistry, "find" | "hasConfiguredAuth">): ModelChoice {
+  const separator = reference.indexOf("/");
+  const model = separator > 0 ? registry.find(reference.slice(0, separator), reference.slice(separator + 1)) : undefined;
+  if (!model || !registry.hasConfiguredAuth(model)) throw new Error(`User-requested main model is not authenticated: ${reference}`);
+  return { model, levels: getSupportedThinkingLevels(model) };
+}
+
+export function validateMainSelection(
   model: string | undefined,
   thinking: ThinkingLevel | undefined,
-  availableModels: readonly Model<any>[],
+  choices: readonly ModelChoice[],
+  userRequestedModel?: ModelChoice,
 ): void {
-  if (thinking && !model) throw new Error("Main-agent thinking requires an explicit model");
-  if (!model) return;
-
-  const selected = availableModels.find((candidate) => modelReference(candidate) === model);
-  if (!selected) throw new Error(`Main-agent model is not authenticated: ${model}`);
-  if (thinking && !getSupportedThinkingLevels(selected).includes(thinking)) {
+  if (!model?.trim() || thinking === undefined) throw new Error("Main mode requires an explicit model and thinking level");
+  const selected = userRequestedModel ?? choices.find((choice) => modelReference(choice.model) === model);
+  if (!selected || modelReference(selected.model) !== model) {
+    throw new Error(choices.length === 0
+      ? "No authenticated models in the current session scope; ordinary main selection is unavailable"
+      : `Main-agent model is outside the current authenticated session scope: ${model}`);
+  }
+  if (!selected.levels.includes(thinking)) {
     throw new Error(`Main-agent model ${model} does not support thinking ${thinking}`);
   }
 }

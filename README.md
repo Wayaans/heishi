@@ -26,16 +26,17 @@ Choose Global or Current project first, then configure the default mode, main-mo
 
 ## Usage
 
-Heishi gives Pi three tools:
+Heishi gives Pi four tools:
 
+- `subagent_models` discovers scoped main-mode models, supported thinking levels, and saved worker defaults
 - `subagent_start` starts a worker in the configured terminal host
-- `subagent_control` — prompt, steer, follow up, abort, resume, or clean up a worker workspace
-- `subagent_wait` — wait for a worker to finish and return its report
+- `subagent_control` prompts, steers, follows up, aborts, resumes, or cleans up a worker workspace
+- `subagent_wait` waits for a worker to finish and returns its report
 
 Workers have two modes:
 
 - `sub` (default) uses Heishi's fast, constrained resource profile and requires a model/thinking pair configured through `/heishi`.
-- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. Model selection follows this priority: values explicitly requested by the user, the parent session's exact active model and thinking level, then a deliberately selected pair from the configured delegation pool as the final fallback. It can delegate recursively.
+- `main` loads normal Pi resources, including extensions, skills, prompt templates, themes, context files, settings, and packages. Pass both `model` and `thinking` explicitly on every start, using `subagent_models` for discovery. Use saved worker defaults as the baseline; the agent may choose a scoped model and supported thinking level suited to the task. Explicit user requests take priority independently for each field. Main mode does not inherit the parent's active model or thinking level and does not fall back to the delegation pool. It can delegate recursively.
 
 Choose a mode by the task's intended repository side effects, not by keywords:
 
@@ -48,9 +49,26 @@ Tell read-only workers not to modify files and to return findings in their final
 
 The main agent passes `mode` explicitly after classifying a task. Configure the fallback globally or for a trusted project through `/heishi`. An explicit `subagent_start.mode` overrides the effective configured value for one run. The built-in default is `sub` when neither scope sets a value.
 
+Heishi passes the explicit pair to Pi and verifies both fields before submitting the task. If Pi substitutes a model or clamps thinking, the start fails. Start calls display the actual selected model reference; successful results also show the verified pair. Resuming a main worker restores its saved session model and thinking level.
+
 Main workers mirror the parent session's project trust. They load trusted extensions with normal process permissions and model credentials; they are not sandboxes.
 
 Use `/subagent` to manage workers in the interactive overlay. Both modes prefer structured reports and fall back to the worker's final assistant response.
+
+### Main model discovery
+
+Call `subagent_models` with `{}` before selecting a main-mode pair. It returns:
+
+- `models`: only authenticated members of the current session's Pi scope, each with `model` and `thinkingLevels`.
+- `defaults`: `{ pair: { model, thinking } }`, or `{ error }` when saved defaults cannot be resolved within that scope.
+
+The scope is `ctx.scopedModels`, the current session's cycling models from `--models` or `enabledModels`. Main selection exposes every thinking level the model supports; cycling patterns' optional thinking pins do not restrict main choices. An empty scope disables ordinary main selection rather than listing all authenticated models. Sub-mode delegation-pool behavior is unchanged.
+
+The baseline comes from saved Pi settings in the worker's agent directory and the source checkout, with trusted project settings overriding global settings. A saved per-model thinking level overrides `defaultThinkingLevel`. Missing, unreadable, out-of-scope, or unsupported defaults produce a resolution error, not a fabricated pair. Discovery still returns scoped choices for deliberate overrides. These are saved defaults, not a simulation of Pi's prospective startup selection or worktree settings. Both explicit launch arguments override those startup defaults.
+
+For an explicit user model request, `subagent_models` accepts `userRequestedModel: "provider/model"` to inspect that exact authenticated model, including outside scope. It adds a `userRequestedModel` entry with its supported thinking levels without listing other out-of-scope models. Pass `userRequestedModel: true` to `subagent_start` only when the user requested the selected model. This main-only exception also works with an empty scope; it never bypasses authentication or supported-thinking validation. The flag is the agent's declaration, not proof of user authorization. An explicit thinking-only request does not authorize an out-of-scope model.
+
+Discovery output is limited to 50 KB or 2000 lines and marks truncation.
 
 ### Worktree workspaces
 

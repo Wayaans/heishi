@@ -5,6 +5,7 @@ import {
   CONFIG_DIR_NAME,
   getAgentDir,
   getMarkdownTheme,
+  truncateHead,
   type ExtensionAPI,
   type ExtensionContext,
   type Theme,
@@ -26,8 +27,11 @@ import {
   allowedPairs,
   availableModelChoices,
   loadEffectiveConfig,
+  mainModelChoices,
   modelReference,
-  validateMainOverrides,
+  savedMainDefaults,
+  userRequestedModelChoice,
+  validateMainSelection,
   type DelegationPair,
   type EffectiveHeishiConfig,
 } from "./model-config.js";
@@ -55,13 +59,24 @@ import { resolveWorkspace } from "./workspace.js";
 
 const ThinkingSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
-  { description: "Optional thinking level. Required for sub mode. In main mode, prioritize an explicit user request, then the parent session's exact level, and use a delegation-pool level only as the final fallback" },
+  { description: "Required explicit thinking level. Main: use discovered saved defaults as the baseline, allow task-suited choices, and honor an explicit user request independently of model. Sub: use an allowed model/thinking pair" },
 );
 
+const ModelsParams = Type.Object({
+  userRequestedModel: Type.Optional(Type.String({ description: "Exact provider/model reference explicitly requested by the user; permits targeted inspection outside scope, not broad catalogue browsing" })),
+});
+
+interface ModelsDetails {
+  defaults: ReturnType<typeof savedMainDefaults>;
+  models: Array<{ model: string; thinkingLevels: Array<typeof THINKING_LEVELS[number]> }>;
+  userRequestedModel?: ModelsDetails["models"][number];
+}
+
 const MAIN_MODEL_GUIDELINES = [
-  "In main mode, first use any authenticated model or thinking level explicitly requested by the user, even when the model is outside the Heishi delegation pool.",
-  "When the user does not explicitly request a main-mode model or thinking level, use the parent session's exact active model and thinking level.",
-  "Use the Heishi delegation pool only as the final fallback when the parent session's exact model/thinking pair is unavailable; deliberately choose and pass the exact pool pair that best fits the task.",
+  "Before main-mode `subagent_start`, call `subagent_models` to discover current-session scoped models, supported thinking levels, and saved worker defaults. Pass both `model` and `thinking` explicitly in every mode.",
+  "Use the saved worker model/thinking pair as the main-mode baseline; you may choose scoped models and supported thinking levels suited to the task. Explicit user requests take priority independently for each field. Reject invalid or unsupported user pairs instead of substituting another pair.",
+  "Set `subagent_start.userRequestedModel` to true only when the user explicitly requested that model. This declaration allows an authenticated model outside the current session scope, including when scope is empty. Use `subagent_models.userRequestedModel` for targeted discovery of that exact provider/model reference. This is an agent declaration, not proof of user authorization.",
+  "Do not inherit the parent session's active model or thinking level, or use the Heishi delegation pool as a fallback for main mode.",
 ] as const;
 
 const TASK_MODE_GUIDELINES = [
@@ -149,10 +164,75 @@ export default function heishi(pi: ExtensionAPI): void {
     coordinator = undefined;
   });
 
+  pi.registerTool<typeof ModelsParams, ModelsDetails>({
+    name: "subagent_models",
+    label: "Discover Subagent Models",
+    description: "List only current-session scoped main models and supported thinking levels, with saved worker defaults or a default-resolution error. Optionally inspect one explicit user-requested authenticated model outside scope. Output is limited to 50 KB or 2000 lines.",
+    promptSnippet: "Discover scoped main-agent model choices and saved worker defaults",
+    parameters: ModelsParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const choices = mainModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels);
+      const requested = params.userRequestedModel === undefined
+        ? undefined
+        : userRequestedModelChoice(params.userRequestedModel, ctx.modelRegistry);
+      const details = {
+        defaults: savedMainDefaults(ctx.cwd, getAgentDir(), ctx.isProjectTrusted(), choices),
+        models: choices.map(({ model, levels }) => ({ model: modelReference(model), thinkingLevels: levels })),
+        ...(requested ? { userRequestedModel: { model: modelReference(requested.model), thinkingLevels: requested.levels } } : {}),
+      };
+      const output = truncateHead(JSON.stringify(details, null, 2));
+      return {
+        content: [{ type: "text", text: output.content + (output.truncated ? "\n[Scoped model output truncated]" : "") }],
+        details,
+      };
+    },
+    renderCall(args, theme, context) {
+      return {
+        render(width) {
+          const count = context.state["scopedModelCount"];
+          const scoped = typeof count === "number" ? ` · ${count} scoped model${count === 1 ? "" : "s"}` : "";
+          const requested = args.userRequestedModel ? ` · requested ${args.userRequestedModel}` : "";
+          return new Text(
+            `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_models"))}${theme.fg("dim", ` · main${scoped}${requested}`)}`,
+            0,
+            0,
+          ).render(width);
+        },
+        invalidate() {},
+      };
+    },
+    renderResult(result, { expanded }, theme, context) {
+      if (context.isError) {
+        const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+        return new Text(theme.fg("error", text), 0, 0);
+      }
+      const details = result.details;
+      if (!details) return fallbackResult(result);
+      context.state["scopedModelCount"] = details.models.length;
+      const defaults = details.defaults;
+      let text = "pair" in defaults
+        ? `  ${theme.fg("muted", "Default:")} ${theme.fg("accent", `${defaults.pair.model} / ${defaults.pair.thinking}`)}`
+        : `  ${theme.fg("warning", `Default unavailable: ${defaults.error}`)}`;
+      const requested = details.userRequestedModel;
+      if (requested) {
+        const outside = details.models.some(({ model }) => model === requested.model) ? "" : " · outside session scope";
+        text += `\n  ${theme.fg("muted", "Requested:")} ${theme.fg("accent", requested.model)}${theme.fg("dim", outside)}`;
+        text += `\n    ${theme.fg("dim", `Thinking: ${requested.thinkingLevels.join(", ")}`)}`;
+      }
+      if (expanded && details.models.length > 0) {
+        text += "\n";
+        for (const choice of details.models) {
+          text += `\n  ${theme.fg("accent", choice.model)}\n    ${theme.fg("dim", `Thinking: ${choice.thinkingLevels.join(", ")}`)}`;
+        }
+      }
+      return new Text(text, 0, 0);
+    },
+  });
+
   pi.registerTool({
     name: "subagent_start",
     label: "Start Subagent",
-    description: "Start an asynchronous persistent worker in sub or main mode. Sub requires an allowed model/thinking pair; main prioritizes a user-requested pair, then the parent session's exact pair, and finally a delegation-pool pair. Main may use an isolated Git worktree workspace.",
+    description: "Start an asynchronous persistent worker with an explicit model/thinking pair. Sub requires an allowed delegation pair. Main uses scoped choices from subagent_models, with an authenticated out-of-scope exception only for declared user-requested models. Main may use an isolated Git worktree workspace.",
     promptSnippet: "Start persistent interactive subagents in a managed terminal host",
     promptGuidelines: [
       "Use `subagent_start` for delegated multi-step work that benefits from a persistent interactive terminal session or live steering.",
@@ -176,8 +256,9 @@ export default function heishi(pi: ExtensionAPI): void {
       )),
       task: Type.String({ description: "Self-contained delegated brief with objective, background and decisions, scope and exclusions, relevant paths or symbols, constraints and assumptions, expected deliverable, and verification; the worker receives no parent conversation" }),
       alias: Type.Optional(Type.String({ description: "Optional display alias; if omitted, a Greek mythological name is chosen" })),
-      model: Type.Optional(Type.String({ description: "Model in provider/model form. Required in sub mode. In main mode, prioritize an explicit user request, then the parent session's exact model, and use the delegation pool only as the final fallback" })),
-      thinking: Type.Optional(ThinkingSchema),
+      model: Type.String({ description: "Required exact provider/model reference. Main: choose from subagent_models using saved defaults as baseline unless the task or an explicit user request calls for another model. Sub: use the delegation pool" }),
+      thinking: ThinkingSchema,
+      userRequestedModel: Type.Optional(Type.Boolean({ description: "Main only. Set true only for an explicit user model request to allow an authenticated model outside current session scope. Agent declaration, not proof of authorization; unsupported thinking still errors" })),
       placement: Type.Optional(Type.Union(
         [Type.Literal("pane"), Type.Literal("window"), Type.Literal("session")],
         { description: "Optional worker placement. Omit unless the user explicitly requests one; omission defaults to session in sub mode and window in main mode" },
@@ -191,6 +272,7 @@ export default function heishi(pi: ExtensionAPI): void {
       const mode = params.mode ?? config.mode;
       const workspace = resolveWorkspace(mode, params.workspace, config.workspace);
       if (mode === "sub") {
+        if (params.userRequestedModel !== undefined) throw new Error("userRequestedModel is available only in main mode");
         const pairs = effectivePairs(ctx);
         if (pairs.length === 0) {
           throw new Error(configError ?? "Heishi delegation models are not configured; use /heishi settings");
@@ -202,16 +284,23 @@ export default function heishi(pi: ExtensionAPI): void {
           throw new Error(`Subagent model/thinking pair is not allowed: ${params.model} / ${params.thinking}`);
         }
       } else {
-        validateMainOverrides(params.model, params.thinking, ctx.modelRegistry.getAvailable());
+        const requested = params.userRequestedModel === true && params.model
+          ? userRequestedModelChoice(params.model, ctx.modelRegistry)
+          : undefined;
+        validateMainSelection(
+          params.model, params.thinking,
+          mainModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels),
+          requested,
+        );
       }
 
       const input: StartInput = {
         mode,
         workspace,
         task: params.task,
+        model: params.model,
+        thinking: params.thinking,
       };
-      if (params.model !== undefined) input.model = params.model;
-      if (params.thinking !== undefined) input.thinking = params.thinking;
       if (params.alias !== undefined) input.alias = params.alias;
       if (params.placement !== undefined) input.placement = params.placement;
       return toolResult(await requireCoordinator().start(input, signal));
@@ -222,8 +311,9 @@ export default function heishi(pi: ExtensionAPI): void {
       const task = typeof args.task === "string" ? args.task : "";
       const mode = args.mode ? ` · ${args.mode}` : "";
       const workspace = args.workspace ? ` · ${args.workspace}` : "";
+      const model = args.model ?? "…";
       container.addChild(new Text(
-        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", `${mode}${workspace} · ${args.model ?? "…"} / ${args.thinking ?? "…"}`)}`,
+        `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", `${mode}${workspace} · ${model} / ${args.thinking ?? "…"}`)}`,
         0,
         0,
       ));
@@ -357,7 +447,7 @@ export default function heishi(pi: ExtensionAPI): void {
       "Auto mode detects tmux or cmux for each new start and resume. Active workers keep their recorded host.",
     ].join("\n");
     const poolGuidance = pairs.length === 0
-      ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode remains available when the user explicitly requests an authenticated model."
+      ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode uses subagent_models discovery and requires an explicit model/thinking pair; it is independent of this pool."
       : [
           "The Heishi delegation pool contains these exact model/thinking pairs:",
           ...pairs.map((pair) => `- ${pair.model} / ${pair.thinking}`),
@@ -369,10 +459,7 @@ export default function heishi(pi: ExtensionAPI): void {
     const cleanupGuidance = config.cleanupApproval === "ask"
       ? "Worktree cleanup currently requires interactive confirmation."
       : "Worktree cleanup is currently allowed without confirmation, but all worktree safety checks still apply.";
-    const sessionModelGuidance = ctx.model && ctx.thinkingLevel
-      ? `The parent session's exact active model/thinking pair is ${modelReference(ctx.model)} / ${ctx.thinkingLevel}.`
-      : "The parent session's exact active model/thinking pair is unavailable; use the Heishi delegation pool as the final fallback for main mode.";
-    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${sessionModelGuidance}\n${cleanupGuidance}\n${poolGuidance}` };
+    return { systemPrompt: `${event.systemPrompt}\n\n${modeGuidance}\n${taskModeGuidance}\n${delegationBriefGuidance}\n${mainModelGuidance}\n${cleanupGuidance}\n${poolGuidance}` };
   });
 
   pi.registerCommand("heishi", {
@@ -496,7 +583,10 @@ function fallbackResult(result: RenderableResult): Text {
 
 function renderRunResult(details: RunResult | undefined, result: RenderableResult, theme: Theme): Text {
   if (!details) return fallbackResult(result);
-  return new Text(runStatusHeader(details, theme), 0, 0);
+  const startedWith = details.status === "running"
+    ? `\n  ${theme.fg("dim", `Started with: ${details.model ?? "…"} / ${details.thinking ?? "…"}`)}`
+    : "";
+  return new Text(`${runStatusHeader(details, theme)}${startedWith}`, 0, 0);
 }
 
 function renderControlRunResult(details: ControlRunResult | undefined, result: RenderableResult, theme: Theme): Text {
