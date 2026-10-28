@@ -71,6 +71,25 @@ describe("terminal host resolver", () => {
     await assert.rejects(() => resolver.resolve("auto"), /tmux: tmux missing; cmux: cmux missing/u);
   });
 
+  it("prefers an available multiplexer over headless in auto mode", async () => {
+    const tmux = new FakeHost("tmux");
+    const cmux = new FakeHost("cmux");
+    cmux.validationError = new Error("cmux missing");
+    const resolver = new TerminalHostResolver([tmux, cmux, new FakeHost("headless")]);
+
+    assert.equal((await resolver.resolve("auto")).kind, "tmux");
+  });
+
+  it("falls back to headless when no multiplexer is available", async () => {
+    const tmux = new FakeHost("tmux");
+    const cmux = new FakeHost("cmux");
+    tmux.validationError = new Error("tmux missing");
+    cmux.validationError = new Error("cmux missing");
+    const resolver = new TerminalHostResolver([tmux, cmux, new FakeHost("headless")]);
+
+    assert.equal((await resolver.resolve("auto")).kind, "headless");
+  });
+
   it("dispatches persisted targets to their concrete host", () => {
     const tmux = new FakeHost("tmux");
     const cmux = new FakeHost("cmux");

@@ -222,8 +222,8 @@ function parseConfig(value: unknown): HeishiConfig {
 
   const terminalHost = value["terminalHost"];
   if (terminalHost !== undefined) {
-    if (terminalHost !== "auto" && terminalHost !== "tmux" && terminalHost !== "cmux") {
-      throw new Error("terminalHost must be auto, tmux, or cmux");
+    if (terminalHost !== "auto" && terminalHost !== "tmux" && terminalHost !== "cmux" && terminalHost !== "headless") {
+      throw new Error("terminalHost must be auto, tmux, cmux, or headless");
     }
     config.terminalHost = terminalHost;
   }

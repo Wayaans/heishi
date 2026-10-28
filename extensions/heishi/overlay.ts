@@ -77,12 +77,18 @@ export async function showSubagentOverlay(
       continue;
     }
 
+    // Headless workers have no terminal to focus, so the overlay stays open on them instead.
     if (run.paneState === "open") {
+      if (run.hostTarget?.host === "headless") {
+        await showDetails(ctx, run);
+        continue;
+      }
       await coordinator.control({ runId: run.runId, action: "focus" });
       return;
     }
     if (run.workerSessionFile) {
       const resumed = await coordinator.control({ runId: run.runId, action: "resume" });
+      if (resumed.hostTarget?.host === "headless") continue;
       if (resumed.hostTarget) await coordinator.control({ runId: run.runId, action: "focus" });
       return;
     }

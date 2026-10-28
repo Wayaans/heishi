@@ -139,7 +139,7 @@ async function editDefaults(
         label: "Terminal host",
         description: scopeDescription(scope),
         currentValue: scope === "project" ? config.terminalHost ?? "inherit" : config.terminalHost ?? "auto",
-        values: scope === "project" ? ["inherit", "auto", "tmux", "cmux"] : ["auto", "tmux", "cmux"],
+        values: scope === "project" ? ["inherit", "auto", "tmux", "cmux", "headless"] : ["auto", "tmux", "cmux", "headless"],
       },
       {
         id: "cleanupApproval",
@@ -197,7 +197,7 @@ function updateDefault(config: HeishiConfig, id: string, value: string): HeishiC
     else if (value === "shared" || value === "worktree") updated.workspace = value;
   } else if (id === "terminalHost") {
     if (value === "inherit") delete updated.terminalHost;
-    else if (value === "auto" || value === "tmux" || value === "cmux") updated.terminalHost = value;
+    else if (value === "auto" || value === "tmux" || value === "cmux" || value === "headless") updated.terminalHost = value;
   } else if (id === "cleanupApproval") {
     if (value === "inherit") delete updated.worktree;
     else if (value === "ask" || value === "allow") updated.worktree = { cleanupApproval: value };

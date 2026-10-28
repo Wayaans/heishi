@@ -1,7 +1,7 @@
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 export type Placement = "pane" | "window" | "session";
-export type TerminalHostKind = "tmux" | "cmux";
+export type TerminalHostKind = "tmux" | "cmux" | "headless";
 export type TerminalHostPreference = "auto" | TerminalHostKind;
 
 export interface HostLaunch {
@@ -35,7 +35,13 @@ export interface CmuxHostTarget {
   dedicatedWorkspace?: boolean;
 }
 
-export type HostTarget = TmuxHostTarget | CmuxHostTarget;
+export interface HeadlessHostTarget {
+  host: "headless";
+  pid: number;
+  startedAt: string;
+}
+
+export type HostTarget = TmuxHostTarget | CmuxHostTarget | HeadlessHostTarget;
 
 export interface TerminalHost {
   readonly kind: TerminalHostKind;
@@ -54,9 +60,11 @@ export interface TerminalHosts {
 export function terminalTargetLabel(target: HostTarget): string {
   const id = target.host === "tmux"
     ? target.paneId
-    : target.closeKind === "surface"
-      ? target.surfaceId
-      : target.workspaceId;
+    : target.host === "headless"
+      ? `pid ${target.pid}`
+      : target.closeKind === "surface"
+        ? target.surfaceId
+        : target.workspaceId;
   return `${target.host} ${id}`;
 }
 
