@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { reconcileRuns, restoreRunSnapshots } from "./registry.js";
+import { HeadlessHost } from "./headless.js";
 import { TerminalHostResolver } from "./terminal-host-resolver.js";
 import type { TerminalHosts } from "./terminal-host.js";
 import { TmuxHost, type TmuxAdapter } from "./tmux.js";
@@ -145,6 +146,29 @@ describe("run registry restoration", () => {
       assert.deepEqual(restoreRunSnapshots([
         { type: "custom", customType: "heishi:subagent-run", data: malformed },
       ]), []);
+    }
+  });
+
+  it("restores headless process targets and rejects invalid process IDs", () => {
+    const target = { host: "headless" as const, pid: 4242, startedAt: "Tue Oct 28 10:26:15 2026" };
+    const headless = makeRunRecord({ hostTarget: target });
+    delete headless.tmuxTarget;
+    delete headless.tmuxWindowId;
+    delete headless.tmuxSessionId;
+    assert.deepEqual(restoreRunSnapshots([
+      { type: "custom", customType: "heishi:subagent-run", data: headless },
+    ])[0]?.hostTarget, target);
+
+    for (const malformedTarget of [
+      ...[0, -1, 1.5, "4242"].map((pid) => ({ ...target, pid })),
+      { ...target, startedAt: "" },
+      { host: "headless", pid: 4242 },
+    ]) {
+      assert.deepEqual(restoreRunSnapshots([{
+        type: "custom",
+        customType: "heishi:subagent-run",
+        data: { ...headless, hostTarget: malformedTarget },
+      }]), []);
     }
   });
 
@@ -407,6 +431,23 @@ describe("run registry restoration", () => {
     assert.equal(restored[0]?.paneState, "disconnected");
     assert.equal(restored[0]?.status, "failed");
     assert.match(restored[0]?.error ?? "", /no longer exists/);
+  });
+
+  it("marks restored headless workers closed when their process has exited", async () => {
+    const run = makeRunRecord({ hostTarget: { host: "headless", pid: 4242, startedAt: "Tue Oct 28 10:26:15 2026" } });
+    delete run.tmuxTarget;
+    delete run.tmuxWindowId;
+    delete run.tmuxSessionId;
+    const missingProcess = Object.assign(new Error("ps exited"), { code: 1 });
+    const hosts = new TerminalHostResolver([
+      new HeadlessHost({ exec: async () => { throw missingProcess; } }),
+    ]);
+
+    const restored = await reconcileRuns([run], hosts);
+
+    assert.equal(restored[0]?.paneState, "closed");
+    assert.equal(restored[0]?.status, "failed");
+    assert.match(restored[0]?.error ?? "", /exited with the previous parent session/);
   });
 
   it("closes restored panes that no longer have a parent IPC connection", async () => {

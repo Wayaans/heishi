@@ -22,6 +22,7 @@ import { Type } from "typebox";
 import { WorktreeCleanupApproval } from "./cleanup.js";
 import { Cmux } from "./cmux.js";
 import { RunCoordinator } from "./coordinator.js";
+import { HeadlessHost } from "./headless.js";
 import { IpcHub } from "./ipc.js";
 import {
   allowedPairs,
@@ -104,7 +105,7 @@ export default function heishi(pi: ExtensionAPI): void {
   }
 
   const tmux = new Tmux();
-  const hosts = new TerminalHostResolver([new TmuxHost(tmux), new Cmux()]);
+  const hosts = new TerminalHostResolver([new TmuxHost(tmux), new Cmux(), new HeadlessHost()]);
   const ipc = new IpcHub();
   const worktrees = new GitWorktrees(getAgentDir());
   const worktreeCleanup = new WorktreeCleanupApproval();
@@ -444,7 +445,7 @@ export default function heishi(pi: ExtensionAPI): void {
       `The current Heishi main-mode workspace default is \`${config.workspace}\`.`,
       "Omitting subagent_start.workspace uses this effective configured value in main mode. Sub mode always uses the shared checkout and rejects an explicit worktree.",
       `The current Heishi terminal host is \`${config.terminalHost}\`.`,
-      "Auto mode detects tmux or cmux for each new start and resume. Active workers keep their recorded host.",
+      "Auto mode detects tmux or cmux for each new start and resume, and falls back to a headless background process when neither is available. Active workers keep their recorded host.",
     ].join("\n");
     const poolGuidance = pairs.length === 0
       ? "The Heishi delegation pool is empty, so sub mode is disabled. Main mode uses subagent_models discovery and requires an explicit model/thinking pair; it is independent of this pool."
@@ -611,7 +612,9 @@ function runStatusHeader(result: RunResult, theme: Theme): string {
     ? `tmux · pane ${target.paneId}${target.windowId ? ` · window ${target.windowId}` : ""}${target.sessionId ? ` · session ${target.sessionId}` : ""}`
     : target?.host === "cmux"
       ? `cmux · ${target.closeKind} ${target.closeKind === "surface" ? target.surfaceId : target.workspaceId}`
-      : "";
+      : target?.host === "headless"
+        ? `headless · pid ${target.pid}`
+        : "";
   const worktree = result.workspace === "worktree"
     ? `\n  ${theme.fg("dim", result.worktree
         ? `Worktree: ${displayWorktreePath(result.worktree.path)} · ${result.worktree.branch} · base ${result.worktree.baseCommit} · ${result.worktree.state}`

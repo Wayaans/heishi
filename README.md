@@ -1,13 +1,13 @@
 # Heishi
 
-Persistent, interactive subagents for [Pi](https://github.com/earendil-works/pi-mono), running in tmux or cmux.
+Persistent, interactive subagents for [Pi](https://github.com/earendil-works/pi-mono), running in tmux, cmux, or a headless background process.
 
 Heishi lets Pi delegate work to concurrent agent sessions, steer them while they run, and resume completed sessions without losing context.
 
 ## Requirements
 
 - [Pi](https://github.com/earendil-works/pi-mono)
-- [tmux](https://github.com/tmux/tmux) or [cmux](https://cmux.com)
+- Optional: [tmux](https://github.com/tmux/tmux) or [cmux](https://cmux.com) to watch and focus workers in a terminal
 - At least one authenticated Pi model
 
 ## Install
@@ -80,7 +80,9 @@ After reviewing or integrating the work yourself, use `subagent_control` action 
 
 ### Terminal hosts
 
-Set `terminalHost` to `auto`, `tmux`, or `cmux` through `/heishi`. The built-in default is `auto`. Explicit values validate only the selected host. Auto mode checks the current tmux and cmux caller contexts for each start and resume. If both hosts are valid, Heishi compares the controlling terminal with the tmux pane. It refuses an ambiguous result and asks you to select a host instead of launching into the wrong terminal.
+Set `terminalHost` to `auto`, `tmux`, `cmux`, or `headless` through `/heishi`. The built-in default is `auto`. Explicit values validate only the selected host. Auto mode checks the current tmux and cmux caller contexts for each start and resume. If both hosts are valid, Heishi compares the controlling terminal with the tmux pane. It refuses an ambiguous result and asks you to select a host instead of launching into the wrong terminal. If neither is available, auto mode falls back to `headless`.
+
+The `headless` host runs each worker as a background `pi --mode rpc` child process. Workers keep the same steering, reports, resume, and cleanup behavior, but have no terminal to focus: `/subagent` shows details instead, and `subagent_control` action `focus` fails. Extension dialogs inside a headless worker are cancelled automatically because nobody can answer them. Headless workers shut down when the parent Pi process exits, after finishing any active turn. Heishi records each worker's PID and start time, so a restored session verifies the exact process is gone, or stops it, before allowing resume or cleanup. Placement has no effect.
 
 Active workers keep their recorded host even if the setting changes. A settled worker may resume in another host after its previous target is verified closed. Heishi stores stable cmux UUIDs and the cmux socket path, not topology-dependent short references.
 

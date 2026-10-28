@@ -54,7 +54,12 @@ export async function reconcileRuns(
     } catch (error) {
       return update("disconnected", `Could not inspect restored subagent terminal target ${label}: ${errorMessage(error)}`);
     }
-    if (!paneExists) return update("disconnected", `Subagent terminal target ${label} no longer exists`);
+    if (!paneExists) {
+      // A missing headless process is verified gone by its PID and start time, so it can be resumed or cleaned up.
+      return target.host === "headless"
+        ? update("closed", `Subagent worker ${label} exited with the previous parent session`)
+        : update("disconnected", `Subagent terminal target ${label} no longer exists`);
+    }
 
     let closeError: string | undefined;
     try {
@@ -241,6 +246,13 @@ function parseHostTarget(value: unknown): HostTarget | undefined {
         : {}),
       ...(target["dedicatedWorkspace"] === true ? { dedicatedWorkspace: true } : {}),
     };
+  }
+  if (target["host"] === "headless"
+    && typeof target["pid"] === "number"
+    && Number.isSafeInteger(target["pid"])
+    && target["pid"] > 0
+    && isNonEmptyString(target["startedAt"])) {
+    return { host: "headless", pid: target["pid"], startedAt: target["startedAt"] };
   }
   return undefined;
 }
