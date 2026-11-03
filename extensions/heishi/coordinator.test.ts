@@ -6,7 +6,7 @@ import type { ProtocolEnvelope } from "./protocol.js";
 import { TerminalHostResolver } from "./terminal-host-resolver.js";
 import type { CmuxHostTarget, HostLaunch, HostTarget, TerminalHost } from "./terminal-host.js";
 import { TmuxHost, type TmuxAdapter, type TmuxLaunch, type TmuxTarget } from "./tmux.js";
-import type { RunRecord, WorktreeRecord } from "./types.js";
+import type { RunCompletion, RunRecord, WorktreeRecord } from "./types.js";
 import { WorktreeOperationError, type WorktreeAdapter, type WorktreeRollbackResult } from "./worktree.js";
 
 class FakeChannel implements WorkerChannel {
@@ -189,6 +189,7 @@ function fixture(ready: Partial<WorkerReady> = {}, terminalHost?: TerminalHost):
   tmux: FakeTmux;
   worktrees: FakeWorktrees;
   records: RunRecord[];
+  completions: RunCompletion[];
 } {
   const channel = new FakeChannel({
     model: "openai/model",
@@ -201,6 +202,7 @@ function fixture(ready: Partial<WorkerReady> = {}, terminalHost?: TerminalHost):
   const tmux = new FakeTmux();
   const worktrees = new FakeWorktrees();
   const records: RunRecord[] = [];
+  const completions: RunCompletion[] = [];
   let runNumber = 0;
   const dependencies: CoordinatorDependencies = {
     cwd: "/repo",
@@ -213,6 +215,7 @@ function fixture(ready: Partial<WorkerReady> = {}, terminalHost?: TerminalHost):
     ipc,
     worktrees,
     persist: (record) => { records.push(structuredClone(record)); },
+    notifyCompletion: (completion) => { completions.push(completion); },
     projectTrusted: true,
     newRunId: () => runNumber++ === 0
       ? "12345678-1234-1234-1234-123456789abc"
@@ -224,7 +227,7 @@ function fixture(ready: Partial<WorkerReady> = {}, terminalHost?: TerminalHost):
       return () => new Date(1_700_000_000_000 + tick++ * 1000).toISOString();
     })(),
   };
-  return { coordinator: new RunCoordinator(dependencies), ipc, tmux, worktrees, records };
+  return { coordinator: new RunCoordinator(dependencies), ipc, tmux, worktrees, records, completions };
 }
 
 async function pause(): Promise<void> {
@@ -263,7 +266,7 @@ function completedMainRun(): RunRecord {
 
 describe("run coordinator", () => {
   it("starts asynchronously only after verified readiness, then closes on agent_settled", async () => {
-    const { coordinator, ipc, tmux } = fixture();
+    const { coordinator, ipc, tmux, completions } = fixture();
     const started = await coordinator.start({ task: "Inspect the repository", model: "openai/model", thinking: "high" });
 
     assert.equal(tmux.validated, true);
@@ -295,18 +298,22 @@ Inspect the repository`,
       type: "report", runId: started.runId, version: 1,
       report: { status: "completed", summary: "Done", structured: true },
     });
+    assert.equal(completions.length, 0);
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
-    const completed = await coordinator.wait(started.runId);
 
-    assert.equal(completed.status, "completed");
-    assert.equal(completed.report?.summary, "Done");
-    assert.equal(completed.durationMs, 3_000);
+    assert.equal(completions.length, 1);
+    const completed = completions[0];
+    assert.equal(completed?.runId, started.runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.report?.summary, "Done");
+    assert.equal(completed?.durationMs, 3_000);
+    assert.equal(coordinator.list()[0]?.completionDelivered, true);
     assert.deepEqual(tmux.closed, ["%9"]);
   });
 
   it("runs the lifecycle through a cmux-shaped generic host target", async () => {
     const cmux = new FakeCmux();
-    const { coordinator, ipc, records } = fixture({}, cmux);
+    const { coordinator, ipc, records, completions } = fixture({}, cmux);
     const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
 
     assert.equal(cmux.validated, true);
@@ -315,9 +322,8 @@ Inspect the repository`,
     assert.deepEqual(records.at(-1)?.hostTarget, cmux.target);
 
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
-    const completed = await coordinator.wait(started.runId);
 
-    assert.equal(completed.status, "completed");
+    assert.equal(completions[0]?.status, "completed");
     assert.deepEqual(cmux.closed, [cmux.target]);
     assert.deepEqual(records.at(-1)?.hostTarget, cmux.target);
     assert.equal(records.at(-1)?.paneState, "closed");
@@ -439,17 +445,19 @@ Inspect the repository`,
     assert.deepEqual(afterLaunch.worktrees.rolledBack, []);
   });
 
-  it("requires both main model and thinking before preparing or launching a worker", async () => {
-    const { coordinator, tmux, worktrees } = fixture();
-    for (const pair of [{}, { model: "provider/requested" }, { thinking: "high" as const }]) {
-      await assert.rejects(
-        () => coordinator.start({ mode: "main", workspace: "worktree", task: "Implement", ...pair }),
-        /Main mode requires an explicit model and thinking level/u,
-      );
+  it("starts workers with Pi's default model and thinking when neither is requested", async () => {
+    for (const mode of ["sub", "main"] as const) {
+      const { coordinator, tmux } = fixture({ model: "provider/pi-default", thinking: "medium" });
+
+      const started = await coordinator.start({ mode, task: "Inspect" });
+
+      assert.equal(started.status, "running");
+      assert.equal(started.model, "provider/pi-default");
+      assert.equal(started.thinking, "medium");
+      assert.equal(tmux.launches[0]?.command.includes("--model"), false);
+      assert.equal(tmux.launches[0]?.command.includes("--thinking"), false);
+      await coordinator.shutdown();
     }
-    assert.deepEqual(tmux.launches, []);
-    assert.deepEqual(worktrees.prepared, []);
-    await coordinator.shutdown();
   });
 
   it("starts main mode with an explicit saved-default pair in the shared workspace", async () => {
@@ -476,7 +484,7 @@ Inspect the repository`,
   });
 
   it("returns structured external-input requests from blocked workers", async () => {
-    const { coordinator, ipc } = fixture();
+    const { coordinator, ipc, completions } = fixture();
     const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
     const request = {
       kind: "decision" as const,
@@ -494,9 +502,9 @@ Inspect the repository`,
     });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1 });
 
-    const blocked = await coordinator.wait(started.runId);
-    assert.equal(blocked.status, "blocked");
-    assert.deepEqual(blocked.report?.request, request);
+    const blocked = completions[0];
+    assert.equal(blocked?.status, "blocked");
+    assert.deepEqual(blocked?.report?.request, request);
   });
 
   it("rejects blocked reports without a structured external-input request", async () => {
@@ -525,16 +533,16 @@ Inspect the repository`,
       report: { status: "completed", summary: "Structured main report" },
     });
     await structured.ipc.emit({ type: "settled", runId: first.runId, version: 1, finalText: "Fallback" });
-    const structuredResult = await structured.coordinator.wait(first.runId);
-    assert.equal(structuredResult.report?.summary, "Structured main report");
-    assert.equal(structuredResult.report?.structured, true);
+    const structuredResult = structured.completions[0];
+    assert.equal(structuredResult?.report?.summary, "Structured main report");
+    assert.equal(structuredResult?.report?.structured, true);
 
     const fallback = fixture();
     const second = await fallback.coordinator.start({ mode: "main", model: "openai/model", thinking: "high", task: "Inspect" });
     await fallback.ipc.emit({ type: "settled", runId: second.runId, version: 1, finalText: "Main fallback" });
-    const fallbackResult = await fallback.coordinator.wait(second.runId);
-    assert.equal(fallbackResult.report?.summary, "Main fallback");
-    assert.equal(fallbackResult.report?.structured, false);
+    const fallbackResult = fallback.completions[0];
+    assert.equal(fallbackResult?.report?.summary, "Main fallback");
+    assert.equal(fallbackResult?.report?.structured, false);
   });
 
   it("verifies explicit main model and thinking overrides", async () => {
@@ -780,16 +788,10 @@ Inspect the repository`,
     assert.equal(coordinator.list()[0]?.status, "failed");
   });
 
-  it("targets the fixed background session when session placement is requested", async () => {
+  it("targets the fixed background session for sub workers", async () => {
     const { coordinator, tmux } = fixture();
 
-    await coordinator.start({
-      mode: "main",
-      model: "openai/model",
-      thinking: "high",
-      task: "Inspect in the background",
-      placement: "session",
-    });
+    await coordinator.start({ task: "Inspect in the background" });
 
     assert.equal(tmux.launches[0]?.placement, "session");
     assert.equal(tmux.launches[0]?.sessionName, "heishi-subagents");
@@ -811,23 +813,45 @@ Inspect the repository`,
     await coordinator.shutdown();
   });
 
-  it("keeps existing waiters attached when a follow-up is queued", async () => {
-    const { coordinator, ipc } = fixture();
+  it("delivers the result of a worker that settles while its task is still being sent", async () => {
+    const { coordinator, ipc, completions } = fixture();
+    let releaseSend!: () => void;
+    ipc.channel.sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+
+    const starting = coordinator.start({ task: "Inspect" });
+    while (ipc.channel.sent.length === 0) await pause();
+    await ipc.emit({ type: "settled", runId: "12345678-1234-1234-1234-123456789abc", version: 1, finalText: "Fast" });
+    releaseSend();
+    const started = await starting;
+
+    assert.equal(started.status, "completed");
+    assert.deepEqual(completions.map((completion) => completion.report?.summary), ["Fast"]);
+    assert.equal(coordinator.list()[0]?.status, "completed");
+    assert.deepEqual(coordinator.takePendingCompletions(), []);
+  });
+
+  it("does not redeliver a startup failure already returned by start", async () => {
+    const { coordinator, completions } = fixture({ model: "openai/fallback" });
+
+    const failed = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+
+    assert.equal(failed.status, "failed");
+    assert.equal(completions.length, 0);
+    assert.deepEqual(coordinator.takePendingCompletions(), []);
+  });
+
+  it("delivers one completion when a follow-up is queued during active work", async () => {
+    const { coordinator, ipc, completions } = fixture();
     const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
-    const waiting = coordinator.wait(started.runId);
 
     await coordinator.control({ runId: started.runId, action: "follow_up", message: "Also run checks" });
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Done" });
 
-    const result = await Promise.race([
-      waiting,
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("waiter was stranded")), 25)),
-    ]);
-    assert.equal(result.status, "completed");
+    assert.deepEqual(completions.map((completion) => completion.status), ["completed"]);
   });
 
   it("preserves cancelled status when abort causes agent_settled", async () => {
-    const { coordinator, ipc } = fixture();
+    const { coordinator, ipc, completions } = fixture();
     const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
 
     const aborting = coordinator.control({ runId: started.runId, action: "abort" });
@@ -835,44 +859,75 @@ Inspect the repository`,
     await ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Stopped" });
 
     assert.equal((await aborting).status, "cancelled");
+    assert.deepEqual(completions.map((completion) => completion.status), ["cancelled"]);
+  });
+
+  it("delivers a failed completion when an active worker disconnects", async () => {
+    const { coordinator, ipc, completions } = fixture();
+    const started = await coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+
+    await ipc.emit({ type: "disconnect", runId: started.runId, version: 1 });
+
+    assert.equal(completions.length, 1);
+    assert.equal(completions[0]?.status, "failed");
+    assert.equal(completions[0]?.error, "Subagent disconnected");
+  });
+
+  it("keeps results of runs stopped by shutdown pending until they are taken once", async () => {
+    const first = fixture();
+    const started = await first.coordinator.start({ task: "Inspect", model: "openai/model", thinking: "high" });
+    const shutdown = first.coordinator.shutdown();
+    await first.ipc.emit({ type: "settled", runId: started.runId, version: 1, finalText: "Stopped" });
+    await shutdown;
+
+    assert.deepEqual(first.completions, []);
+    const snapshot = first.records.at(-1);
+    assert.equal(snapshot?.status, "cancelled");
+    assert.equal(snapshot?.completionDelivered, false);
+
+    const restored = fixture();
+    restored.coordinator.restore(snapshot ? [snapshot, completedRun()] : []);
+    const pending = restored.coordinator.takePendingCompletions();
+    assert.deepEqual(pending.map((completion) => [completion.runId, completion.status]), [[started.runId, "cancelled"]]);
+    assert.equal(restored.records.at(-1)?.completionDelivered, true);
+    assert.deepEqual(restored.coordinator.takePendingCompletions(), []);
+    assert.deepEqual(restored.completions, []);
   });
 
   it("marks a terminal run active and auto-closes its resumed pane after a follow-up", async () => {
-    const { coordinator, ipc, tmux } = fixture();
+    const { coordinator, ipc, tmux, completions } = fixture();
     coordinator.restore([completedRun()]);
     await coordinator.control({ runId: "run-1", action: "resume" });
     let releaseSend!: () => void;
     ipc.channel.sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
 
     const followingUp = coordinator.control({ runId: "run-1", action: "follow_up", message: "Check again" });
-    let waitResolved = false;
-    const waiting = coordinator.wait("run-1").then((result) => { waitResolved = true; return result; });
     await new Promise((resolve) => setTimeout(resolve, 1));
-    assert.equal(waitResolved, false);
+    assert.equal(coordinator.list()[0]?.status, "running");
 
     releaseSend();
     await followingUp;
+    assert.equal(completions.length, 0);
     await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Checked" });
-    assert.equal((await waiting).status, "completed");
+    assert.deepEqual(completions.map((completion) => completion.status), ["completed"]);
     assert.equal(coordinator.list()[0]?.paneState, "closed");
     assert.deepEqual(tmux.closed, ["%9"]);
     await coordinator.shutdown();
   });
 
   it("tracks work typed directly into a resumed interactive pane", async () => {
-    const { coordinator, ipc } = fixture();
+    const { coordinator, ipc, completions } = fixture();
     coordinator.restore([completedRun()]);
     await coordinator.control({ runId: "run-1", action: "resume" });
 
     await ipc.emit({ type: "progress", runId: "run-1", version: 1, message: "started", workStarted: true });
-    let resolved = false;
-    const waiting = coordinator.wait("run-1").then((result) => { resolved = true; return result; });
-    await new Promise((resolve) => setTimeout(resolve, 1));
-    assert.equal(resolved, false);
+    assert.equal(completions.length, 0);
 
     await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Direct work done" });
-    assert.equal((await waiting).report?.summary, "Direct work done");
+    assert.equal(completions.length, 1);
+    assert.equal(completions[0]?.report?.summary, "Direct work done");
     await coordinator.shutdown();
+    assert.equal(completions.length, 1);
   });
 
   it("validates cleanup before prompting and repeats worktree checks during cleanup", async () => {
@@ -1100,10 +1155,21 @@ Inspect the repository`,
     assert.deepEqual(tmux.closed, ["%9"]);
     assert.equal(tmux.existingTargets.size, 0);
     assert.equal(records.at(-1)?.status, "cancelled");
-    await assert.rejects(
-      () => coordinator.control({ runId: "run-1", action: "prompt", message: "More" }),
-      /not connected/u,
-    );
+  });
+
+  it("resumes a closed worker automatically before prompting it", async () => {
+    const { coordinator, ipc, tmux, completions } = fixture();
+    coordinator.restore([completedRun()]);
+
+    const prompted = await coordinator.control({ runId: "run-1", action: "prompt", message: "Check again" });
+
+    assert.equal(prompted.status, "running");
+    assert.equal(tmux.launches.length, 1);
+    assert.equal(tmux.launches[0]?.environment["HEISHI_RESUME"], "1");
+    assert.deepEqual(ipc.channel.sent.at(-1), { type: "prompt", payload: { message: "Check again" } });
+    await ipc.emit({ type: "settled", runId: "run-1", version: 1, finalText: "Checked" });
+    assert.deepEqual(completions.map((completion) => completion.status), ["completed"]);
+    assert.equal(coordinator.list()[0]?.paneState, "closed");
   });
 
   it("cancels and waits for an in-progress resume during shutdown", async () => {

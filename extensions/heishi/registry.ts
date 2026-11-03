@@ -95,8 +95,8 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
   const workspace = legacyShared ? "shared" : run["workspace"];
   const worktree = legacyShared ? undefined : normalizeWorktreeRecord(run["worktree"]);
   const validWorkspace = isValidWorkspaceSnapshot(run, mode, workspace, worktree);
-  const validModel = typeof run["model"] === "string" || (mode === "main" && run["model"] === undefined);
-  const validThinking = isThinkingLevel(run["thinking"]) || (mode === "main" && run["thinking"] === undefined);
+  const validModel = typeof run["model"] === "string" || run["model"] === undefined;
+  const validThinking = isThinkingLevel(run["thinking"]) || run["thinking"] === undefined;
   if ((version !== 1 && version !== 2 && version !== 3 && version !== 4)
     || (mode !== "sub" && mode !== "main")
     || !validWorkspace
@@ -114,7 +114,8 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
     || typeof run["updatedAt"] !== "string"
     || OPTIONAL_STRING_FIELDS.some((field) => run[field] !== undefined && typeof run[field] !== "string")
     || !hasValidHostMetadata(run, version, hostTarget)
-    || (run["report"] !== undefined && !isSubagentReport(run["report"]))) return undefined;
+    || (run["report"] !== undefined && !isSubagentReport(run["report"]))
+    || (run["completionDelivered"] !== undefined && typeof run["completionDelivered"] !== "boolean")) return undefined;
 
   const normalized: RunRecord = {
     version: 4,
@@ -136,6 +137,7 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
   if (isThinkingLevel(run["thinking"])) normalized.thinking = run["thinking"];
   for (const field of OPTIONAL_STRING_FIELDS) copyOptionalString(run, normalized, field);
   if (isSubagentReport(run["report"])) normalized.report = run["report"];
+  if (typeof run["completionDelivered"] === "boolean") normalized.completionDelivered = run["completionDelivered"];
   return normalized;
 }
 

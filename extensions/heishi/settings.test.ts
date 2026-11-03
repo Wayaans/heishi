@@ -67,7 +67,6 @@ describe("Heishi settings", () => {
       await saveConfig(paths.global, {
         mode: "main",
         workspace: "worktree",
-        models: [{ model: "provider/global", thinking: "high" }],
         worktree: { cleanupApproval: "allow" },
       });
       let selections = 0;

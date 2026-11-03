@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import { describe, it } from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
-import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { WorktreeCleanupApproval } from "./cleanup.js";
 import heishi, { currentPiInvocation } from "./index.js";
+import { RUN_ENTRY_TYPE } from "./registry.js";
 import type { ControlInput, RunRecord, RunResult } from "./types.js";
 
 interface RegisteredTool {
@@ -53,6 +54,8 @@ interface RegisteredCommand {
   handler(args: string, ctx: unknown): Promise<void>;
 }
 
+initTheme("dark", false);
+
 describe("Heishi tool prompt metadata", () => {
   it("resolves a relative current script before workers change cwd", async () => {
     const root = await mkdtemp(join(tmpdir(), "heishi-index-test-"));
@@ -73,14 +76,14 @@ describe("Heishi tool prompt metadata", () => {
       on() {},
       registerCommand() {},
       registerTool(tool: RegisteredTool) { tools.push(tool); },
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI;
 
     heishi(pi);
 
     const start = requireTool(tools, "subagent_start");
     const control = requireTool(tools, "subagent_control");
-    const wait = requireTool(tools, "subagent_wait");
-    for (const tool of [start, control, wait]) {
+    for (const tool of [start, control]) {
       assert.ok(tool.promptSnippet?.trim(), `${tool.name} should have a prompt snippet`);
       assert.ok(tool.promptGuidelines?.some((guideline) => guideline.includes(`\`${tool.name}\``)), `${tool.name} guidelines should name the tool`);
       for (const [name, schema] of Object.entries(tool.parameters.properties ?? {})) {
@@ -114,9 +117,6 @@ describe("Heishi tool prompt metadata", () => {
     }));
     assert.match(start.parameters.properties?.["task"]?.description ?? "", /worker receives no parent conversation/u);
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("both `window` and `session` open a surface tab in the caller pane");
-    }));
-    assert.ok(start.promptGuidelines?.some((guideline) => {
       return guideline.includes("classify the task by its intended repository side effects")
         && guideline.includes("pass `mode` explicitly");
     }));
@@ -139,70 +139,46 @@ describe("Heishi tool prompt metadata", () => {
         && guideline.includes("final report");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("call `subagent_models`")
-        && guideline.includes("saved worker defaults")
-        && guideline.includes("Pass both `model` and `thinking` explicitly");
+      return guideline.includes("Omit `model` and `thinking` unless the user explicitly requests them")
+        && guideline.includes("Pi's default model and thinking level");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("saved worker model/thinking pair as the main-mode baseline")
-        && guideline.includes("Explicit user requests take priority independently for each field")
-        && guideline.includes("suited to the task");
+      return guideline.includes("run in the background")
+        && guideline.includes("arrives automatically")
+        && guideline.includes("Do not poll");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("Do not inherit the parent session's active model or thinking level")
-        && guideline.includes("or use the Heishi delegation pool as a fallback for main mode");
-    }));
-    assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("use `subagent_control` first only when live interaction is needed")
-        && guideline.includes("otherwise use `subagent_wait` immediately")
+      return guideline.includes("end your turn")
         && guideline.includes("Do not inspect, implement, or answer");
     }));
     assert.ok(start.promptGuidelines?.some((guideline) => guideline.includes("non-overlapping files") && guideline.includes("worktree workspaces")));
     assert.ok(control.promptGuidelines?.some((guideline) => {
-      return guideline.includes("After `subagent_wait` returns")
-        && guideline.includes("`resume`")
-        && guideline.includes("`prompt` or `follow_up`");
+      return guideline.includes("action `prompt` to give a worker new work after its completion message arrives")
+        && guideline.includes("resumes the closed worker automatically");
     }));
     assert.ok(control.promptGuidelines?.some((guideline) => {
-      return guideline.includes("Use `steer` only while")
-        && guideline.includes("do not use `steer` after `subagent_wait`");
+      return guideline.includes("Use `steer` only while a subagent is actively running")
+        && guideline.includes("use `prompt` instead");
     }));
     assert.ok(control.promptGuidelines?.some((guideline) => {
-      return guideline.includes("After `prompt`, `follow_up`, or `steer`")
-        && guideline.includes("`subagent_wait`");
-    }));
-    assert.ok(wait.promptGuidelines?.some((guideline) => {
-      return guideline.includes("blocked report with a structured request")
+      return guideline.includes("reports `blocked` with a structured request")
         && guideline.includes("obtain the requested external input in the parent session")
-        && guideline.includes("resume the worker")
-        && guideline.includes("call `subagent_wait` again");
+        && guideline.includes("action `prompt`");
     }));
+    assert.equal(
+      [...(start.promptGuidelines ?? []), ...(control.promptGuidelines ?? [])].some((guideline) => {
+        return /subagent_wait|subagent_models|delegation pool|follow_up|`resume`|cleanup|`placement`/u.test(guideline);
+      }),
+      false,
+    );
     assert.ok(control.promptGuidelines?.some((guideline) => {
       return guideline.includes("Do not assign write work to a sub-mode run")
         && guideline.includes("start a main-mode run instead");
     }));
-    assert.ok(control.promptGuidelines?.some((guideline) => {
-      return guideline.includes("configured worktree approval policy")
-        && guideline.includes("queues interactive confirmations")
-        && guideline.includes("allow mode skips the prompt");
-    }));
-    assert.ok(start.promptGuidelines?.some((guideline) => {
-      return guideline.includes("`placement` parameter is optional")
-        && guideline.includes("Omit it unless the user explicitly requests")
-        && guideline.includes("defaults to `session` in sub mode")
-        && guideline.includes("`window` in main mode");
-    }));
-    assert.match(
-      start.parameters.properties?.["placement"]?.description ?? "",
-      /Omit unless the user explicitly requests one; omission defaults to session in sub mode and window in main mode/u,
-    );
-    assert.deepEqual(
-      start.parameters.properties?.["placement"]?.anyOf?.map((placement) => placement.const),
-      ["pane", "window", "session"],
-    );
+    assert.equal(start.parameters.properties?.["placement"], undefined);
     assert.deepEqual(
       control.parameters.properties?.["action"]?.anyOf?.map((action) => action.const),
-      ["prompt", "steer", "follow_up", "abort", "resume", "cleanup"],
+      ["prompt", "steer", "abort"],
     );
     assert.deepEqual(
       start.parameters.properties?.["mode"]?.anyOf?.map((mode) => mode.const),
@@ -212,9 +188,9 @@ describe("Heishi tool prompt metadata", () => {
       start.parameters.properties?.["workspace"]?.anyOf?.map((workspace) => workspace.const),
       ["shared", "worktree"],
     );
-    assert.equal(start.parameters.required?.includes("model"), true);
-    assert.equal(start.parameters.required?.includes("thinking"), true);
-    assert.deepEqual(tools.map((tool) => tool.name), ["subagent_models", "subagent_start", "subagent_control", "subagent_wait"]);
+    assert.equal(start.parameters.required?.includes("model"), false);
+    assert.equal(start.parameters.required?.includes("thinking"), false);
+    assert.deepEqual(tools.map((tool) => tool.name), ["subagent_start", "subagent_control"]);
   });
 
   it("runs cleanup only after interactive confirmation", async () => {
@@ -356,7 +332,7 @@ describe("Heishi tool prompt metadata", () => {
     assert.deepEqual(second.controls, [{ runId: second.run.runId, action: "cleanup" }]);
   });
 
-  it("injects the mode and main-model selection policies into the main agent prompt", () => {
+  it("injects the mode and delegation policies into the main agent prompt", () => {
     type BeforeAgentStart = (
       event: { systemPrompt: string },
       ctx: {
@@ -373,6 +349,7 @@ describe("Heishi tool prompt metadata", () => {
       },
       registerCommand() {},
       registerTool() {},
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI;
 
     heishi(pi);
@@ -394,14 +371,7 @@ describe("Heishi tool prompt metadata", () => {
     assert.match(result.systemPrompt, /Use `sub` mode for read-only work/u);
     assert.match(result.systemPrompt, /Use `main` mode for write work/u);
     assert.match(result.systemPrompt, /pass `mode` explicitly/u);
-    assert.match(result.systemPrompt, /call `subagent_models`/u);
-    assert.match(result.systemPrompt, /saved worker model\/thinking pair as the main-mode baseline/u);
-    assert.match(result.systemPrompt, /Pass both `model` and `thinking` explicitly/u);
-    assert.match(result.systemPrompt, /Explicit user requests take priority independently for each field/u);
-    assert.match(result.systemPrompt, /agent declaration, not proof of user authorization/u);
-    assert.match(result.systemPrompt, /Do not inherit the parent session's active model or thinking level/u);
-    assert.match(result.systemPrompt, /Main mode uses subagent_models discovery and requires an explicit model\/thinking pair/u);
-    assert.doesNotMatch(result.systemPrompt, /provider\/session-model|exact active model\/thinking pair|final fallback/u);
+    assert.doesNotMatch(result.systemPrompt, /subagent_models|delegation pool|cleanup|provider\/session-model/u);
   });
 
   it("accepts only the interactive settings command", async () => {
@@ -411,6 +381,7 @@ describe("Heishi tool prompt metadata", () => {
       on() {},
       registerTool() {},
       registerCommand(name: string, command: RegisteredCommand) { commands.set(name, command); },
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI;
     heishi(pi);
     const command = commands.get("heishi");
@@ -429,179 +400,49 @@ describe("Heishi tool prompt metadata", () => {
     ]);
   });
 
-  it("keeps explicit main mode available with an empty sub pool", async () => {
+  it("starts without a model pool and validates only explicit model requests", async () => {
     const tools: RegisteredTool[] = [];
-    const pi = {
+    heishi({
       on() {},
       registerTool(tool: RegisteredTool) { tools.push(tool); },
       registerCommand() {},
-    } as unknown as ExtensionAPI;
-    heishi(pi);
+      registerMessageRenderer() {},
+    } as unknown as ExtensionAPI);
     const start = requireTool(tools, "subagent_start").execute;
     assert.ok(start);
-    const ctx = {
-      modelRegistry: { getAvailable: () => [] },
-      scopedModels: [],
-      ui: { notify() {} },
-    };
-
-    await assert.rejects(
-      () => start("call-1", { mode: "main", task: "Inspect" }, undefined, undefined, ctx),
-      /Main mode requires an explicit model and thinking level/u,
-    );
-    await assert.rejects(
-      () => start("call-thinking", { mode: "main", task: "Implement", thinking: "high" }, undefined, undefined, ctx),
-      /Main mode requires an explicit model and thinking level/u,
-    );
-    await assert.rejects(
-      () => start("call-model-only", { mode: "main", task: "Implement", model: "provider/requested" }, undefined, undefined, ctx),
-      /Main mode requires an explicit model and thinking level/u,
-    );
-    const requested = testModel("provider", "requested");
-    const requestedContext = {
-      ...ctx,
-      modelRegistry: { getAvailable: () => [requested], find: () => requested, hasConfiguredAuth: () => true },
-    };
-    const pair = { mode: "main", task: "Implement", model: "provider/requested", thinking: "high" };
-    await assert.rejects(
-      () => start("call-pair", pair, undefined, undefined, requestedContext),
-      /No authenticated models in the current session scope/u,
-    );
-    await assert.rejects(
-      () => start("call-user-pair", { ...pair, userRequestedModel: true }, undefined, undefined, requestedContext),
-      /coordinator is not initialized/u,
-    );
-    await assert.rejects(
-      () => start("call-scoped-pair", pair, undefined, undefined, { ...requestedContext, scopedModels: [{ model: requested }] }),
-      /coordinator is not initialized/u,
-    );
-    await assert.rejects(
-      () => start("call-2", { mode: "sub", workspace: "worktree", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
-      /worktree workspace is available only in main mode/ui,
-    );
-    await assert.rejects(
-      () => start("call-3", { mode: "sub", task: "Inspect", model: "provider/model", thinking: "high" }, undefined, undefined, ctx),
-      /delegation models are not configured/u,
-    );
-  });
-
-  it("discovers scoped choices and saved defaults without copying the parent's active pair", async () => {
-    const root = await mkdtemp(join(tmpdir(), "heishi-discovery-"));
-    try {
-      await mkdir(join(root, CONFIG_DIR_NAME));
-      await writeFile(join(root, CONFIG_DIR_NAME, "settings.json"), JSON.stringify({
-        defaultProvider: "provider", defaultModel: "saved", defaultThinkingLevel: "medium",
-        modelThinkingLevels: { "provider/saved": "low" },
-      }));
-      const tools: RegisteredTool[] = [];
-      heishi({
-        on() {}, registerCommand() {},
-        registerTool(tool: RegisteredTool) { tools.push(tool); },
-      } as unknown as ExtensionAPI);
-      const discover = requireTool(tools, "subagent_models").execute;
-      assert.ok(discover);
-      const saved = testModel("provider", "saved");
-      const active = testModel("provider", "active");
-      const requested = testModel("provider", "outside");
-      const ctx = {
-        cwd: root, isProjectTrusted: () => true,
-        model: active, thinkingLevel: "high",
-        scopedModels: [{ model: saved, thinkingLevel: "high" }],
-        modelRegistry: {
-          getAvailable: () => [saved, active, requested],
-          find: (provider: string, id: string) => provider === "provider" && id === "outside" ? requested : undefined,
-          hasConfiguredAuth: () => true,
-        },
-      };
-      const result = JSON.stringify(await discover("models", {}, undefined, undefined, ctx));
-      assert.match(result, /provider\/saved/u);
-      assert.match(result, /"pair":\{"model":"provider\/saved","thinking":"low"\}/u);
-      assert.doesNotMatch(result, /provider\/active|provider\/outside|baseUrl/u);
-      const targeted = JSON.stringify(await discover("requested", { userRequestedModel: "provider/outside" }, undefined, undefined, ctx));
-      assert.match(targeted, /"userRequestedModel":\{"model":"provider\/outside"/u);
-      assert.doesNotMatch(targeted, /provider\/active/u);
-      const empty = JSON.stringify(await discover("empty", {}, undefined, undefined, { ...ctx, scopedModels: [] }));
-      assert.match(empty, /No authenticated models in the current session scope/u);
-      assert.doesNotMatch(empty, /provider\/saved|provider\/active|provider\/outside/u);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects undeclared out-of-scope choices, unsupported user pairs, and sub exceptions", async () => {
-    const tools: RegisteredTool[] = [];
-    heishi({ on() {}, registerCommand() {}, registerTool(tool: RegisteredTool) { tools.push(tool); } } as unknown as ExtensionAPI);
-    const start = requireTool(tools, "subagent_start").execute;
-    assert.ok(start);
-    const scoped = testModel("provider", "scoped");
     const plain = { ...testModel("provider", "plain"), reasoning: false };
     const ctx = {
-      scopedModels: [{ model: scoped }],
-      modelRegistry: { getAvailable: () => [scoped, plain], find: () => plain, hasConfiguredAuth: () => true },
+      modelRegistry: {
+        find: (provider: string, id: string) => provider === "provider" && id === "plain" ? plain : undefined,
+        hasConfiguredAuth: () => true,
+      },
     };
-    const pair = { mode: "main", task: "Implement", model: "provider/plain", thinking: "high" };
-    await assert.rejects(() => start("outside", pair, undefined, undefined, ctx), /outside the current authenticated session scope/u);
-    await assert.rejects(() => start("false", { ...pair, userRequestedModel: false }, undefined, undefined, ctx), /outside the current authenticated session scope/u);
-    await assert.rejects(() => start("unsupported", { ...pair, userRequestedModel: true }, undefined, undefined, ctx), /does not support thinking high/u);
-    await assert.rejects(() => start("sub", { ...pair, mode: "sub", userRequestedModel: true }, undefined, undefined, ctx), /available only in main mode/u);
-  });
 
-  it("rejects sub starts outside a non-empty configured pool", async () => {
-    const root = await mkdtemp(join(tmpdir(), "heishi-index-"));
-    try {
-      const configDirectory = join(root, CONFIG_DIR_NAME);
-      await mkdir(configDirectory, { recursive: true });
-      await writeFile(join(configDirectory, "heishi.json"), JSON.stringify({
-        models: [{ model: "provider/allowed", thinking: "high" }],
-      }));
-      const tools: RegisteredTool[] = [];
-      let sessionStart!: (event: unknown, ctx: unknown) => Promise<void>;
-      const pi = {
-        on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
-          if (event === "session_start") sessionStart = handler;
-        },
-        appendEntry() {},
-        registerTool(tool: RegisteredTool) { tools.push(tool); },
-        registerCommand() {},
-      } as unknown as ExtensionAPI;
-      heishi(pi);
-      const available = testModel("provider", "allowed");
-      const ctx = {
-        cwd: root,
-        scopedModels: [],
-        isProjectTrusted: () => true,
-        modelRegistry: { getAvailable: () => [available] },
-        sessionManager: { getBranch: () => [] },
-        ui: { notify() {} },
-      };
-      await sessionStart({ reason: "startup" }, ctx);
-
+    for (const mode of ["sub", "main"]) {
       await assert.rejects(
-        () => requireTool(tools, "subagent_start").execute!(
-          "call-1",
-          { mode: "sub", task: "Inspect", model: "provider/allowed", thinking: "medium" },
-          undefined,
-          undefined,
-          ctx,
-        ),
-        /pair is not allowed/u,
+        () => start(`default-${mode}`, { mode, task: "Inspect" }, undefined, undefined, ctx),
+        /coordinator is not initialized/u,
       );
-      const start = requireTool(tools, "subagent_start").execute;
-      assert.ok(start);
-      for (const overrides of [{ model: "provider/allowed" }, { thinking: "high" }]) {
-        await assert.rejects(
-          () => start(
-            "call-missing-pair", { mode: "sub", task: "Inspect", ...overrides }, undefined, undefined, ctx,
-          ),
-          /Sub mode requires an explicit model and thinking level/u,
-        );
-      }
-    } finally {
-      await rm(root, { recursive: true, force: true });
     }
+    await assert.rejects(
+      () => start("explicit", { mode: "sub", task: "Inspect", model: "provider/plain", thinking: "off" }, undefined, undefined, ctx),
+      /coordinator is not initialized/u,
+    );
+    await assert.rejects(
+      () => start("missing", { mode: "main", task: "Inspect", model: "provider/missing" }, undefined, undefined, ctx),
+      /not available or authenticated/u,
+    );
+    await assert.rejects(
+      () => start("unsupported", { mode: "main", task: "Inspect", model: "provider/plain", thinking: "high" }, undefined, undefined, ctx),
+      /does not support thinking high/u,
+    );
+    await assert.rejects(
+      () => start("worktree", { mode: "sub", workspace: "worktree", task: "Inspect" }, undefined, undefined, ctx),
+      /worktree workspace is available only in main mode/ui,
+    );
   });
 
-  it("loads mode, workspace, terminal host, and cleanup approval from trusted project settings", async () => {
+  it("loads mode, workspace, and terminal host from trusted project settings", async () => {
     const root = await mkdtemp(join(tmpdir(), "heishi-index-"));
     try {
       const configDirectory = join(root, CONFIG_DIR_NAME);
@@ -610,8 +451,6 @@ describe("Heishi tool prompt metadata", () => {
         mode: "main",
         workspace: "worktree",
         terminalHost: "cmux",
-        models: [],
-        worktree: { cleanupApproval: "allow" },
       }));
       let sessionStart!: (event: unknown, ctx: unknown) => Promise<void>;
       let beforeAgentStart!: (event: { systemPrompt: string }, ctx: unknown) => { systemPrompt: string };
@@ -623,6 +462,7 @@ describe("Heishi tool prompt metadata", () => {
         registerTool() {},
         appendEntry() {},
         registerCommand() {},
+        registerMessageRenderer() {},
       } as unknown as ExtensionAPI;
       heishi(pi);
       const model = testModel("provider", "session-model");
@@ -642,7 +482,6 @@ describe("Heishi tool prompt metadata", () => {
       assert.match(prompt, /default mode is `main`/u);
       assert.match(prompt, /workspace default is `worktree`/u);
       assert.match(prompt, /terminal host is `cmux`/u);
-      assert.match(prompt, /cleanup is currently allowed without confirmation/u);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -654,6 +493,7 @@ describe("Heishi tool prompt metadata", () => {
       on() {},
       registerTool() {},
       registerCommand(name: string, command: RegisteredCommand) { commands.set(name, command); },
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI;
     heishi(pi);
     const complete = commands.get("heishi")?.getArgumentCompletions;
@@ -696,6 +536,7 @@ describe("Heishi tool prompt metadata", () => {
         on() {},
         registerTool(tool: RegisteredTool) { tools.push(tool.name); },
         registerCommand(name: string) { commands.push(name); },
+        registerMessageRenderer() {},
       } as unknown as ExtensionAPI);
       await connected;
     } finally {
@@ -708,200 +549,153 @@ describe("Heishi tool prompt metadata", () => {
       await rm(socketPath, { force: true });
     }
 
-    assert.deepEqual(tools, ["subagent_models", "subagent_start", "subagent_control", "subagent_wait", "subagent_report"]);
+    assert.deepEqual(tools, ["subagent_start", "subagent_control", "subagent_report"]);
     assert.deepEqual(commands, ["heishi", "subagent"]);
   });
 
-  describe("model discovery rendering", () => {
-    const tools: RegisteredTool[] = [];
+  it("renders completions as a two-line box that expands to the full report", () => {
+    const renderers = new Map<string, (message: unknown, options: unknown, theme: unknown) => { render(width: number): string[] } | undefined>();
     heishi({
-      on() {}, registerCommand() {},
-      registerTool(tool: RegisteredTool) { tools.push(tool); },
+      on() {},
+      registerCommand() {},
+      registerTool() {},
+      registerMessageRenderer(type: string, renderer: (message: unknown, options: unknown, theme: unknown) => { render(width: number): string[] } | undefined) {
+        renderers.set(type, renderer);
+      },
     } as unknown as ExtensionAPI);
-    const tool = requireTool(tools, "subagent_models");
-    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-    const models = [
-      { model: "provider/model-a", thinkingLevels: ["off", "low", "high"] },
-      { model: "provider/model-b", thinkingLevels: ["low", "high"] },
-    ];
-    const details = { defaults: { pair: { model: "provider/model-a", thinking: "high" } }, models };
-    const context = () => ({
-      state: {} as Record<string, unknown>, executionStarted: true, isPartial: false, isError: false,
-      invalidate() {},
-    });
-
-    it("keeps defaults compact and updates the call header with the scoped count", () => {
-      assert.ok(tool.renderCall);
-      assert.ok(tool.renderResult);
-      const ctx = context();
-      const result = { content: [{ type: "text", text: JSON.stringify(details) }], details };
-      const before = JSON.stringify(result);
-      const header = tool.renderCall({}, theme, ctx);
-      assert.equal(header.render(200).join("\n").trimEnd(), "◐ subagent_models · main");
-      const rendered = tool.renderResult(result, { expanded: false }, theme, ctx).render(200).join("\n").trimEnd();
-      assert.equal(rendered, "  Default: provider/model-a / high");
-      assert.equal(header.render(200).join("\n").trimEnd(), "◐ subagent_models · main · 2 scoped models");
-      assert.equal(JSON.stringify(result), before);
-    });
-
-    it("expands stacked model rows and wraps long names in narrow terminals", () => {
-      assert.ok(tool.renderResult);
-      const result = { content: [], details };
-      const component = tool.renderResult(result, { expanded: true }, theme, context());
-      assert.equal(component.render(200).map((line) => line.trimEnd()).join("\n"), [
-        "  Default: provider/model-a / high", "",
-        "  provider/model-a", "    Thinking: off, low, high",
-        "  provider/model-b", "    Thinking: low, high",
-      ].join("\n"));
-      const longName = "provider/a-model-name-that-exceeds-the-terminal-width";
-      const narrow = tool.renderResult({ content: [], details: {
-        ...details, models: [{ model: longName, thinkingLevels: ["high"] }],
-      } }, { expanded: true }, theme, context()).render(24);
-      assert.ok(narrow.every((line) => line.length <= 24));
-      assert.ok(narrow.map((line) => line.trim()).join("").includes(longName));
-    });
-
-    it("shows requested levels while collapsed and marks only out-of-scope requests", () => {
-      assert.ok(tool.renderCall);
-      assert.ok(tool.renderResult);
-      for (const model of ["provider/model-a", "provider/outside"]) {
-        const ctx = context();
-        const requested = { model, thinkingLevels: ["low", "high"] };
-        const rendered = tool.renderResult({ content: [], details: {
-          ...details, userRequestedModel: requested,
-        } }, { expanded: false }, theme, ctx).render(200).join("\n");
-        assert.ok(rendered.includes(`Requested: ${model}`));
-        assert.match(rendered, /Thinking: low, high/u);
-        assert.equal(rendered.includes("outside session scope"), model === "provider/outside");
-        const header = tool.renderCall({ userRequestedModel: model }, theme, ctx).render(200).join("\n");
-        assert.ok(header.includes(`requested ${model}`));
-        assert.match(header, /2 scoped models/u);
-      }
-    });
-
-    it("keeps default warnings visible with empty scope or valid model choices", () => {
-      assert.ok(tool.renderCall);
-      assert.ok(tool.renderResult);
-      const styledTheme = { ...theme, fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
-      for (const choices of [[], models.slice(0, 1)]) {
-        const ctx = context();
-        const result = { content: [], details: { defaults: { error: "Saved default is unavailable" }, models: choices } };
-        const collapsed = tool.renderResult(result, { expanded: false }, styledTheme, ctx).render(200).join("\n");
-        assert.match(collapsed, /<warning>Default unavailable: Saved default is unavailable<\/warning>/u);
-        const header = tool.renderCall({}, theme, ctx).render(200).join("\n").trimEnd();
-        assert.ok(header.endsWith(choices.length === 0 ? "0 scoped models" : "1 scoped model"));
-        const expanded = tool.renderResult(result, { expanded: true }, theme, ctx).render(200).join("\n");
-        assert.equal(expanded.includes("provider/model-a"), choices.length > 0);
-      }
-    });
-
-    it("renders lookup failures in error color and preserves text-only fallback results", () => {
-      assert.ok(tool.renderResult);
-      const result = { content: [{ type: "text", text: "User-requested main model is not authenticated: provider/missing" }] };
-      const styledTheme = { ...theme, fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
-      const failed = tool.renderResult(result, { expanded: false }, styledTheme, { ...context(), isError: true }).render(200).join("\n");
-      assert.match(failed, /<error>User-requested main model is not authenticated: provider\/missing<\/error>/u);
-      const fallback = tool.renderResult(result, { expanded: false }, theme, context()).render(200).join("\n").trimEnd();
-      assert.equal(fallback, result.content[0]?.text);
-    });
-  });
-
-  it("renders the live subagent duration after the waiting status", () => {
-    const tools: RegisteredTool[] = [];
-    const pi = {
-      on() {},
-      registerCommand() {},
-      registerTool(tool: RegisteredTool) { tools.push(tool); },
-    } as unknown as ExtensionAPI;
-    heishi(pi);
-
-    const renderCall = requireTool(tools, "subagent_wait").renderCall;
-    assert.ok(renderCall);
-    const interval = setInterval(() => {}, 60_000);
-    const state: Record<string, unknown> = { startedAtMs: 0, endedAtMs: 83_000, interval };
-    const rendered = renderCall({
-      runId: "12345678-1234-1234-1234-123456789abc",
-    }, {
+    const renderer = renderers.get("heishi:subagent-completion");
+    assert.ok(renderer);
+    const backgrounds: string[] = [];
+    const theme = {
       fg: (_color: string, text: string) => text,
+      bg: (color: string, text: string) => { backgrounds.push(color); return text; },
       bold: (text: string) => text,
-    }, {
-      state,
-      executionStarted: true,
-      isPartial: false,
-      isError: false,
-      invalidate() {},
-    }).render(80)[0] ?? "";
-
-    assert.equal(
-      rendered,
-      "◐ subagent_wait · 123456 · waiting for agent_settled · 1m 23s",
-    );
-    assert.equal("interval" in state, false);
-  });
-
-  it("renders the run duration at the end of a settled result", () => {
-    const tools: RegisteredTool[] = [];
-    const pi = {
-      on() {},
-      registerCommand() {},
-      registerTool(tool: RegisteredTool) { tools.push(tool); },
-    } as unknown as ExtensionAPI;
-    heishi(pi);
-
-    const renderResult = requireTool(tools, "subagent_wait").renderResult;
-    assert.ok(renderResult);
-    const rendered = renderResult({
-      content: [],
+    };
+    const message = {
+      role: "custom",
+      customType: "heishi:subagent-completion",
+      content: "",
+      display: true,
       details: {
         runId: "12345678-1234-1234-1234-123456789abc",
         alias: "Atalanta",
         status: "completed",
+        mode: "main",
         model: "openai/model",
         thinking: "high",
+        hostTarget: { host: "headless", pid: 42, startedAt: "now" },
+        workspace: "worktree",
+        worktree: { path: "/agent/heishi/worktrees/repo-abc/run-id", branch: "heishi/run-id", baseCommit: "abc", state: "present" },
+        report: { status: "completed", summary: "Implemented the change.", structured: true },
         durationMs: 83_000,
+      },
+    };
+    const render = (expanded: boolean): string[] => (renderer(message, { expanded, outputPad: 0 }, theme)?.render(200) ?? [])
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const collapsed = render(false);
+    assert.deepEqual(collapsed, [
+      "✓ Atalanta · 123456 · main  completed · 1m 23s",
+      "openai/model / high · /worktrees/repo-abc/run-id · heishi/run-id · headless · pid 42",
+    ]);
+    assert.equal(backgrounds.includes("toolSuccessBg"), true);
+
+    const expanded = render(true).join("\n");
+    assert.match(expanded, /Run: 12345678-1234-1234-1234-123456789abc/u);
+    assert.match(expanded, /Implemented the change\./u);
+  });
+
+  it("delivers restored undelivered completions once without starting a turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "heishi-index-"));
+    try {
+      const pending: RunRecord = {
+        version: 4,
+        mode: "sub",
+        workspace: "shared",
+        runId: "12345678-1234-1234-1234-123456789abc",
+        alias: "Atalanta",
+        taskPreview: "Inspect",
+        cwd: root,
+        model: "openai/model",
+        thinking: "high",
+        placement: "session",
+        status: "completed",
+        paneState: "closed",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        completedAt: "2026-01-01T00:01:00.000Z",
+        updatedAt: "2026-01-01T00:01:00.000Z",
+        report: { status: "completed", summary: "Done", structured: true },
+        completionDelivered: false,
+      };
+      const delivered: RunRecord = { ...pending, runId: "abcdefab-1234-1234-1234-123456789abc", completionDelivered: true };
+      const sent: Array<{ message: { customType: string; content: string; details: { runId: string; durationMs: number } }; options: unknown }> = [];
+      const appended: RunRecord[] = [];
+      let sessionStart!: (event: unknown, ctx: unknown) => Promise<void>;
+      heishi({
+        on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
+          if (event === "session_start") sessionStart = handler;
+        },
+        appendEntry(_type: string, record: RunRecord) { appended.push(record); },
+        sendMessage(message: (typeof sent)[number]["message"], options: unknown) { sent.push({ message, options }); },
+        registerTool() {},
+        registerCommand() {},
+        registerMessageRenderer() {},
+      } as unknown as ExtensionAPI);
+      const entries = [pending, delivered].map((data) => ({ type: "custom", customType: RUN_ENTRY_TYPE, data }));
+      const ctx = {
+        cwd: root,
+        scopedModels: [],
+        isProjectTrusted: () => true,
+        modelRegistry: { getAvailable: () => [] },
+        sessionManager: { getBranch: () => entries },
+        ui: { notify() {} },
+      };
+
+      await sessionStart({ reason: "resume" }, ctx);
+
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0]?.message.customType, "heishi:subagent-completion");
+      assert.equal(sent[0]?.message.details.runId, pending.runId);
+      assert.equal(sent[0]?.message.details.durationMs, 60_000);
+      assert.match(sent[0]?.message.content ?? "", /settled with status completed/u);
+      assert.equal(sent[0]?.options, undefined);
+      assert.equal(appended.at(-1)?.runId, pending.runId);
+      assert.equal(appended.at(-1)?.completionDelivered, true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("renders control results as a status header without model details", () => {
+    const tools: RegisteredTool[] = [];
+    heishi({
+      on() {},
+      registerCommand() {},
+      registerTool(tool: RegisteredTool) { tools.push(tool); },
+      registerMessageRenderer() {},
+    } as unknown as ExtensionAPI);
+
+    const renderResult = requireTool(tools, "subagent_control").renderResult;
+    assert.ok(renderResult);
+    const prompted = renderResult({
+      content: [],
+      details: {
+        runId: "12345678-1234-1234-1234-123456789abc",
+        alias: "Atalanta",
+        status: "running",
+        model: "openai-codex/gpt-5.6-luna",
+        thinking: "high",
+        action: "prompt",
       },
     }, {}, {
       fg: (_color: string, text: string) => text,
       bold: (text: string) => text,
-    }, { state: {} }).render(200).join("\n").trimEnd();
+    }).render(200).join("\n");
 
-    assert.match(rendered, /Duration: 1m 23s$/u);
-  });
-
-  it("shows provider, model, and thinking only for resume control results", () => {
-    const tools: RegisteredTool[] = [];
-    const pi = {
-      on() {},
-      registerCommand() {},
-      registerTool(tool: RegisteredTool) { tools.push(tool); },
-    } as unknown as ExtensionAPI;
-    heishi(pi);
-
-    const renderResult = requireTool(tools, "subagent_control").renderResult;
-    assert.ok(renderResult);
-    const theme = {
-      fg: (_color: string, text: string) => text,
-      bold: (text: string) => text,
-    };
-    const details = {
-      runId: "12345678-1234-1234-1234-123456789abc",
-      alias: "Atalanta",
-      status: "completed",
-      model: "openai-codex/gpt-5.6-luna",
-      thinking: "high",
-    };
-
-    const resumed = renderResult({
-      content: [],
-      details: { ...details, action: "resume" },
-    }, {}, theme).render(200).join("\n");
-    const prompted = renderResult({
-      content: [],
-      details: { ...details, action: "prompt" },
-    }, {}, theme).render(200).join("\n");
-
-    assert.match(resumed, /Resumed with: openai-codex\/gpt-5\.6-luna \/ high/u);
-    assert.doesNotMatch(prompted, /openai-codex\/gpt-5\.6-luna|high/u);
+    assert.match(prompted, /Atalanta · 123456  running/u);
+    assert.doesNotMatch(prompted, /openai-codex\/gpt-5\.6-luna/u);
   });
 
   it("renders worktree path, branch, base commit, and state", () => {
@@ -910,6 +704,7 @@ describe("Heishi tool prompt metadata", () => {
       on() {},
       registerCommand() {},
       registerTool(tool: RegisteredTool) { tools.push(tool); },
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI;
     heishi(pi);
 
@@ -946,6 +741,7 @@ describe("Heishi tool prompt metadata", () => {
       on() {},
       registerCommand() {},
       registerTool(tool: RegisteredTool) { tools.push(tool); },
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI);
     const renderCall = requireTool(tools, "subagent_start").renderCall;
     assert.ok(renderCall);
@@ -965,6 +761,7 @@ describe("Heishi tool prompt metadata", () => {
       on() {},
       registerCommand() {},
       registerTool(tool: RegisteredTool) { tools.push(tool); },
+      registerMessageRenderer() {},
     } as unknown as ExtensionAPI;
     heishi(pi);
 
@@ -1094,3 +891,6 @@ function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
   assert.ok(tool, `Expected ${name} to be registered`);
   return tool;
 }
+
+
+

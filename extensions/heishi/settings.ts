@@ -5,14 +5,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import {
-  availableModelChoices,
   loadConfig,
   resolveEffectiveConfig,
   saveConfig,
   type CleanupApproval,
   type HeishiConfig,
 } from "./model-config.js";
-import { pickDelegationPairs } from "./model-picker.js";
 
 interface SettingsPaths {
   global: string;
@@ -52,49 +50,14 @@ export async function showHeishiSettings(
       scope === "global" ? "Configure Heishi globally" : "Configure Heishi for this project",
       [
         `Defaults and cleanup (${effective.mode}, ${effective.workspace}, ${effective.terminalHost}, ${approvalLabel(effective.cleanupApproval)})`,
-        `Delegation models (${effective.models.length} pair${effective.models.length === 1 ? "" : "s"})`,
         "Done",
       ],
     );
     if (!section || section === "Done") break;
 
-    if (section.startsWith("Defaults and cleanup")) {
-      const updated = await editDefaults(ctx, scope, config);
-      if (!sameConfig(config, updated)) {
-        config = updated;
-        await saveConfig(paths[scope], config);
-        changed = true;
-      }
-      continue;
-    }
-
-    await ctx.modelRegistry.refresh();
-    const choices = availableModelChoices(ctx.modelRegistry.getAvailable(), ctx.scopedModels);
-    if (choices.length === 0) {
-      ctx.ui.notify("No authenticated models are available", "warning");
-      continue;
-    }
-
-    if (scope === "project") {
-      const modelBehavior = await ctx.ui.select("Project delegation models", [
-        `Inherit global models (${globalLoaded.config.models?.length ?? 0} configured)`,
-        "Configure project models",
-      ]);
-      if (!modelBehavior) continue;
-      if (modelBehavior.startsWith("Inherit global models")) {
-        if (config.models !== undefined) {
-          config = withoutModels(config);
-          await saveConfig(paths.project, config);
-          changed = true;
-        }
-        continue;
-      }
-    }
-
-    const initial = config.models ?? globalLoaded.config.models ?? [];
-    const selected = await pickDelegationPairs(ctx, choices, initial);
-    if (selected && !sameModels(config.models, selected)) {
-      config = { ...config, models: selected };
+    const updated = await editDefaults(ctx, scope, config);
+    if (!sameConfig(config, updated)) {
+      config = updated;
       await saveConfig(paths[scope], config);
       changed = true;
     }
@@ -205,18 +168,8 @@ function updateDefault(config: HeishiConfig, id: string, value: string): HeishiC
   return updated;
 }
 
-function withoutModels(config: HeishiConfig): HeishiConfig {
-  const updated = structuredClone(config);
-  delete updated.models;
-  return updated;
-}
-
 function sameConfig(left: HeishiConfig, right: HeishiConfig): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function sameModels(current: HeishiConfig["models"], selected: NonNullable<HeishiConfig["models"]>): boolean {
-  return current !== undefined && JSON.stringify(current) === JSON.stringify(selected);
 }
 
 function scopeDescription(scope: SettingsScope): string {

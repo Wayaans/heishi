@@ -18,9 +18,9 @@ import {
 import type { RunCoordinator } from "./coordinator.js";
 import { reportMarkdown, shortRunId } from "./rendering.js";
 import { terminalTargetLabel } from "./terminal-host.js";
-import type { RunRecord, RunStatus } from "./types.js";
+import type { RunRecord, RunResult, RunStatus } from "./types.js";
 
-type OverlayAction = "select" | "steer" | "follow_up" | "abort" | "details" | "close";
+type OverlayAction = "select" | "steer" | "follow_up" | "abort" | "cleanup" | "details" | "close";
 
 interface Selection {
   action: OverlayAction;
@@ -30,6 +30,7 @@ interface Selection {
 export async function showSubagentOverlay(
   coordinator: RunCoordinator,
   ctx: ExtensionCommandContext,
+  cleanupWorktree: (runId: string) => Promise<RunResult>,
 ): Promise<void> {
   let selectedRunId: string | undefined;
   while (true) {
@@ -73,6 +74,19 @@ export async function showSubagentOverlay(
     if (selection.action === "abort") {
       if (await ctx.ui.confirm("Abort subagent", `Abort ${run.alias} and close its terminal target?`)) {
         await coordinator.control({ runId: run.runId, action: "abort" });
+      }
+      continue;
+    }
+    if (selection.action === "cleanup") {
+      if (run.worktree?.state !== "present") {
+        ctx.ui.notify(`${run.alias} has no worktree to clean up`, "info");
+        continue;
+      }
+      try {
+        await cleanupWorktree(run.runId);
+        ctx.ui.notify(`Removed ${run.alias}'s worktree; branch ${run.worktree.branch} was retained`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
       }
       continue;
     }
@@ -131,7 +145,7 @@ class SubagentList implements Component {
     }
     lines.push(this.border(width, "", false));
     lines.push(truncateToWidth(
-      this.theme.fg("dim", "↑↓/jk select · Enter focus/resume · S steer · F follow-up · A abort · D details · Esc close"),
+      this.theme.fg("dim", "↑↓/jk select · Enter focus/resume · S steer · F follow-up · A abort · C clean worktree · D details · Esc close"),
       width,
     ));
     const active = this.runs.filter((run) => run.status === "created" || run.status === "starting" || run.status === "running").length;
@@ -166,6 +180,7 @@ class SubagentList implements Component {
     else if (data === "s" || data === "S") this.done({ action: "steer", runId });
     else if (data === "f" || data === "F") this.done({ action: "follow_up", runId });
     else if (data === "a" || data === "A") this.done({ action: "abort", runId });
+    else if (data === "c" || data === "C") this.done({ action: "cleanup", runId });
     else if (data === "d" || data === "D") this.done({ action: "details", runId });
   }
 

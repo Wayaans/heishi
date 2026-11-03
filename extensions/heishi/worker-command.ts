@@ -24,17 +24,17 @@ export function buildPiCommand(options: PiCommandOptions): string[] {
 }
 
 function buildSubPiCommand(options: PiCommandOptions): string[] {
-  if (!options.model || !options.thinking) throw new Error("Subagent model and thinking are required");
-  return [
+  const command = [
     ...piInvocation(options.piPath),
     "--no-extensions",
     "-e", options.extensionPath,
     "--no-skills",
     "--no-prompt-templates",
-    "--model", options.model,
-    "--thinking", options.thinking,
-    "--name", options.name,
   ];
+  if (options.model) command.push("--model", options.model);
+  if (options.thinking) command.push("--thinking", options.thinking);
+  command.push("--name", options.name);
+  return command;
 }
 
 function buildMainPiCommand(options: PiCommandOptions): string[] {

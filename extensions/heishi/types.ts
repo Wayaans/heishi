@@ -72,6 +72,8 @@ export interface RunRecord {
   updatedAt: string;
   report?: SubagentReport;
   error?: string;
+  // False while a finished work cycle's result has not reached the parent. Older snapshots omit it.
+  completionDelivered?: boolean;
 }
 
 export interface StartInput {
@@ -80,7 +82,6 @@ export interface StartInput {
   alias?: string;
   model?: string;
   thinking?: ThinkingLevel;
-  placement?: Placement;
   workspace?: WorkspaceKind;
 }
 
@@ -112,7 +113,7 @@ export interface RunResult {
   error?: string;
 }
 
-export interface WaitResult extends RunResult {
+export interface RunCompletion extends RunResult {
   durationMs: number;
 }
 

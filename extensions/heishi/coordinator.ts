@@ -19,9 +19,9 @@ import {
   type ExternalInputRequest,
   type RunRecord,
   type RunResult,
+  type RunCompletion,
   type StartInput,
   type SubagentReport,
-  type WaitResult,
   type WorkerMode,
 } from "./types.js";
 import { WorktreeOperationError, worktreeCwd, type WorktreeAdapter } from "./worktree.js";
@@ -47,6 +47,7 @@ export interface CoordinatorDependencies {
   ipc: IpcAdapter;
   worktrees: WorktreeAdapter;
   persist(record: RunRecord): void;
+  notifyCompletion(completion: RunCompletion): void;
   projectTrusted: boolean;
   newRunId?: () => string;
   newToken?: () => string;
@@ -122,7 +123,7 @@ export class RunCoordinator {
       cwd: this.dependencies.cwd,
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
-      placement: input.placement ?? (mode === "main" ? "window" : "session"),
+      placement: mode === "main" ? "window" : "session",
       status: "created",
       paneState: "closed",
       createdAt: timestamp,
@@ -178,15 +179,15 @@ export class RunCoordinator {
         workerSessionId: ready.sessionId,
         workerSessionFile: ready.sessionFile,
       });
-      verifyInitialReady(run, ready, input.model, input.thinking);
+      verifyInitialReady(ready, input.model, input.thinking);
       this.update(run, { model: ready.model, thinking: parseThinkingLevel(ready.thinking) });
       const workspaceNote = run.workspace === "worktree" && run.worktree
         ? `\n\nYou are isolated in Git worktree ${run.worktree.path} on branch ${run.worktree.branch}. Do not merge into the source checkout. Report Git status when you finish.`
         : "";
       throwIfStartCancelled(startOperation, signal);
+      // Mark the run active before sending, so a worker that settles during the send still delivers its result.
+      this.update(run, { status: "running", startedAt: this.now(), completionDelivered: false });
       await channel.send("task", { task: `${DELEGATION_HEADER}\n\n${input.task}${workspaceNote}` });
-      throwIfStartCancelled(startOperation, signal);
-      this.update(run, { status: "running", startedAt: this.now() });
       throwIfStartCancelled(startOperation, signal);
       return resultFromRun(run);
     } catch (error) {
@@ -249,16 +250,26 @@ export class RunCoordinator {
       return resultFromRun(run);
     }
 
+    const startsWork = input.action === "prompt" || input.action === "follow_up";
+    // Settled workers auto-close, so new work resumes a closed worker first.
+    if (startsWork && !this.runtimes.has(run.runId) && run.paneState === "closed") {
+      await this.runLifecycleOperation(run, "resume", (lifecycle) => this.resume(run, lifecycle));
+    }
     const runtime = this.runtimes.get(run.runId);
     if (!runtime || run.paneState !== "open") throw new Error("Subagent is not connected; resume it first");
-    const startsWork = input.action === "prompt" || input.action === "follow_up";
     const previousRun = structuredClone(run);
     const previousSettled = runtime.settled;
     const previousAutoClose = runtime.autoClose;
     runtime.autoClose = true;
     if (startsWork) {
       if (!isActive(run.status)) runtime.settled = deferred();
-      this.update(run, { status: "running", report: undefined, error: undefined, startedAt: this.now() });
+      this.update(run, {
+        status: "running",
+        report: undefined,
+        error: undefined,
+        startedAt: this.now(),
+        completionDelivered: false,
+      });
     }
     try {
       await runtime.channel.send(input.action, { message: input.message as string });
@@ -276,23 +287,13 @@ export class RunCoordinator {
     return resultFromRun(this.requireRun(run.runId));
   }
 
-  async wait(runId: string, signal?: AbortSignal): Promise<WaitResult> {
-    const run = this.requireRun(runId);
-    const runtime = this.runtimes.get(runId);
-    let abortListener: (() => void) | undefined;
-    if (signal && runtime) {
-      abortListener = () => { void this.abortRun(runId); };
-      signal.addEventListener("abort", abortListener, { once: true });
-    }
-    try {
-      if (isActive(run.status) && runtime) await runtime.settled.promise;
-      const settledRun = this.requireRun(runId);
-      const startedAt = Date.parse(settledRun.startedAt ?? settledRun.createdAt);
-      const endedAt = Date.parse(settledRun.completedAt ?? (isActive(settledRun.status) ? this.now() : settledRun.updatedAt));
-      return { ...resultFromRun(settledRun), durationMs: Math.max(0, endedAt - startedAt) };
-    } finally {
-      if (signal && abortListener) signal.removeEventListener("abort", abortListener);
-    }
+  /** Marks restored settled runs whose results never reached the parent as delivered and returns them. */
+  takePendingCompletions(): RunCompletion[] {
+    const pending = [...this.runs.values()].filter((run) => run.completionDelivered === false && !isActive(run.status));
+    return pending.map((run) => {
+      this.update(run, { completionDelivered: true });
+      return completionFromRun(run);
+    });
   }
 
   list(): RunRecord[] {
@@ -420,7 +421,7 @@ export class RunCoordinator {
       throwIfResumeCancelled(lifecycle);
       const ready = await waitForWorkerReady(channel, run.mode);
       throwIfResumeCancelled(lifecycle);
-      if (run.mode === "sub") verifyInitialReady(run, ready, run.model, run.thinking);
+      if (run.mode === "sub") verifyInitialReady(ready, run.model, run.thinking);
       if (ready.sessionId !== run.workerSessionId) {
         throw new Error(`Subagent resumed session ${ready.sessionId}, expected ${run.workerSessionId}`);
       }
@@ -512,6 +513,7 @@ export class RunCoordinator {
       this.update(run, {
         status: "running",
         startedAt: this.now(),
+        completionDelivered: false,
         ...(event["resetReport"] === true || !isActive(run.status) ? { report: undefined, error: undefined } : {}),
       });
       return;
@@ -534,6 +536,7 @@ export class RunCoordinator {
         this.update(run, { status: report.status, report, completedAt: this.now() });
         runtime.settled.resolve();
         runtime.settled = resolvedDeferred();
+        this.deliverCompletion(run);
       }
       return;
     }
@@ -629,6 +632,14 @@ export class RunCoordinator {
     });
     this.runtimes.delete(run.runId);
     runtime.settled.resolve();
+    // Results of runs stopped by shutdown stay pending and are delivered when the session restarts.
+    if (!this.shuttingDown) this.deliverCompletion(run);
+  }
+
+  private deliverCompletion(run: RunRecord): void {
+    if (run.completionDelivered !== false) return;
+    this.update(run, { completionDelivered: true });
+    this.dependencies.notifyCompletion(completionFromRun(run));
   }
 
   private async failStartup(run: RunRecord, error: unknown): Promise<void> {
@@ -645,6 +656,8 @@ export class RunCoordinator {
       paneState: paneResult.paneState,
       completedAt: this.now(),
       error: combineErrors(errorMessage(error), paneResult.error),
+      // The failure is returned by start(), so it must not be delivered again on the next session start.
+      completionDelivered: true,
     });
     this.runtimes.delete(run.runId);
     runtime?.settled.resolve();
@@ -717,8 +730,13 @@ export class RunCoordinator {
   }
 }
 
+function completionFromRun(run: RunRecord): RunCompletion {
+  const startedAt = Date.parse(run.startedAt ?? run.createdAt);
+  const endedAt = Date.parse(run.completedAt ?? run.updatedAt);
+  return { ...resultFromRun(run), durationMs: Math.max(0, endedAt - startedAt) };
+}
+
 function verifyInitialReady(
-  run: RunRecord,
   ready: WorkerReady,
   requestedModel: string | undefined,
   requestedThinking: ThinkingLevel | undefined,
@@ -728,9 +746,6 @@ function verifyInitialReady(
   }
   if (requestedThinking !== undefined && ready.thinking !== requestedThinking) {
     throw new Error(`Subagent requested thinking ${requestedThinking}, but Pi started ${ready.thinking}`);
-  }
-  if (run.mode === "sub" && (requestedModel === undefined || requestedThinking === undefined)) {
-    throw new Error("Subagent model and thinking are required");
   }
   parseThinkingLevel(ready.thinking);
 }
@@ -756,18 +771,10 @@ function workerEnvironment(
   };
 }
 
-function validateStart(input: StartInput): WorkerMode {
+function validateStart(input: StartInput): void {
   if (!input.task.trim()) throw new Error("Subagent task is required");
-  const mode = input.mode ?? "sub";
-  if (mode === "main") {
-    if (!input.model?.trim() || input.thinking === undefined) throw new Error("Main mode requires an explicit model and thinking level");
-    parseThinkingLevel(input.thinking);
-    return mode;
-  }
-  if (!input.model?.trim()) throw new Error("Subagent model is required");
-  if (input.thinking === undefined) throw new Error("Subagent thinking level is required");
-  parseThinkingLevel(input.thinking);
-  return mode;
+  if (input.model !== undefined && !input.model.trim()) throw new Error("Subagent model must not be empty");
+  if (input.thinking !== undefined) parseThinkingLevel(input.thinking);
 }
 
 function parseThinkingLevel(value: unknown): ThinkingLevel {
@@ -894,3 +901,4 @@ function combineErrors(first: string | undefined, second: string | undefined): s
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
