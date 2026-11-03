@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { reconcileRuns, restoreRunSnapshots } from "./registry.js";
+import { parseRunCompletion, reconcileRuns, restoreRunSnapshots } from "./registry.js";
 import { HeadlessHost } from "./headless.js";
 import { TerminalHostResolver } from "./terminal-host-resolver.js";
 import type { TerminalHosts } from "./terminal-host.js";
@@ -34,6 +34,7 @@ function makeRunRecord(overrides: Partial<RunRecord> = {}): RunRecord {
     tmuxTarget: "%1",
     tmuxWindowId: "@1",
     tmuxSessionId: "$1",
+    completionDelivered: true,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:01:00.000Z",
     ...overrides,
@@ -51,6 +52,43 @@ describe("run registry restoration", () => {
     ]);
 
     assert.deepEqual(restored, [latest]);
+  });
+
+  it("treats records without a delivery flag as delivered and keeps pending ones pending", () => {
+    const legacy = makeRunRecord({ status: "completed", paneState: "closed" }) as Partial<RunRecord>;
+    delete legacy.completionDelivered;
+    const pending = makeRunRecord({ runId: "run-2", status: "completed", paneState: "closed", completionDelivered: false });
+
+    const restored = restoreRunSnapshots([
+      { type: "custom", customType: "heishi:subagent-run", data: legacy },
+      { type: "custom", customType: "heishi:subagent-run", data: pending },
+    ]);
+
+    assert.deepEqual(restored.map((run) => [run.runId, run.completionDelivered]), [["run-1", true], ["run-2", false]]);
+  });
+
+  it("accepts only well-formed completion details", () => {
+    const completion = {
+      runId: "run-1",
+      alias: "Circe",
+      status: "completed",
+      durationMs: 1_000,
+      hostTarget: { host: "headless", pid: 42, startedAt: "now" },
+      report: { status: "completed", summary: "Done", structured: true },
+    };
+
+    assert.deepEqual(parseRunCompletion(completion), completion);
+    for (const malformed of [
+      undefined,
+      "text",
+      { ...completion, durationMs: "1s" },
+      { ...completion, status: "done" },
+      { ...completion, hostTarget: { host: "headless", pid: -1, startedAt: "now" } },
+      { ...completion, report: { status: "completed" } },
+      { ...completion, worktree: { path: "/w" } },
+    ]) {
+      assert.equal(parseRunCompletion(malformed), undefined);
+    }
   });
 
   it("normalizes legacy version-1 records to sub mode", () => {

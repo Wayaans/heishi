@@ -7,7 +7,7 @@ import {
   type TerminalHosts,
   type ThinkingLevel,
 } from "./terminal-host.js";
-import type { RunRecord, RunStatus, SubagentReport, WorkspaceKind, WorktreeRecord } from "./types.js";
+import type { RunCompletion, RunRecord, RunStatus, SubagentReport, WorkspaceKind, WorktreeRecord } from "./types.js";
 import { isSafeRelativeCwd } from "./workspace.js";
 
 export const RUN_ENTRY_TYPE = "heishi:subagent-run";
@@ -80,6 +80,35 @@ export async function reconcileRuns(
   }));
 }
 
+/** Validates completion details restored from session messages before rendering them. */
+export function parseRunCompletion(value: unknown): RunCompletion | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const completion = value as Record<string, unknown>;
+  const hostTarget = completion["hostTarget"] === undefined ? undefined : parseHostTarget(completion["hostTarget"]);
+  if (typeof completion["runId"] !== "string"
+    || typeof completion["alias"] !== "string"
+    || !isOneOf(completion["status"], ["created", "starting", "running", "completed", "blocked", "failed", "cancelled"])
+    || typeof completion["durationMs"] !== "number"
+    || (completion["mode"] !== undefined && completion["mode"] !== "main")
+    || (completion["workspace"] !== undefined && completion["workspace"] !== "worktree")
+    || (completion["model"] !== undefined && typeof completion["model"] !== "string")
+    || (completion["thinking"] !== undefined && !isThinkingLevel(completion["thinking"]))
+    || (completion["error"] !== undefined && typeof completion["error"] !== "string")
+    || (completion["report"] !== undefined && !isSubagentReport(completion["report"]))
+    || (completion["hostTarget"] !== undefined && !hostTarget)
+    || (completion["worktree"] !== undefined && !isWorktreeSummary(completion["worktree"]))) return undefined;
+  return value as RunCompletion;
+}
+
+function isWorktreeSummary(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const worktree = value as Record<string, unknown>;
+  return typeof worktree["path"] === "string"
+    && typeof worktree["branch"] === "string"
+    && typeof worktree["baseCommit"] === "string"
+    && isOneOf(worktree["state"], ["present", "removed"]);
+}
+
 export function isActive(status: RunStatus): boolean {
   return status === "created" || status === "starting" || status === "running";
 }
@@ -130,6 +159,8 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
     status: run["status"],
     paneState: run["paneState"],
     ...(hostTarget ? { hostTarget } : {}),
+    // Snapshots from before completion delivery omit the flag and count as delivered.
+    completionDelivered: run["completionDelivered"] !== false,
     createdAt: run["createdAt"],
     updatedAt: run["updatedAt"],
   };
@@ -137,7 +168,6 @@ function normalizeRunRecord(value: unknown): RunRecord | undefined {
   if (isThinkingLevel(run["thinking"])) normalized.thinking = run["thinking"];
   for (const field of OPTIONAL_STRING_FIELDS) copyOptionalString(run, normalized, field);
   if (isSubagentReport(run["report"])) normalized.report = run["report"];
-  if (typeof run["completionDelivered"] === "boolean") normalized.completionDelivered = run["completionDelivered"];
   return normalized;
 }
 

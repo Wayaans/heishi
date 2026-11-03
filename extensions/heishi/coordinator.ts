@@ -126,6 +126,7 @@ export class RunCoordinator {
       placement: mode === "main" ? "window" : "session",
       status: "created",
       paneState: "closed",
+      completionDelivered: true,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
@@ -219,6 +220,8 @@ export class RunCoordinator {
         await this.cancelStartup(run, cancellationMessage);
         throw new StartCancellationError(cancellationMessage);
       }
+      // A worker that already settled during startup has delivered its result; keep that outcome.
+      if (!isActive(run.status)) return resultFromRun(run);
       await this.failStartup(run, startupError);
       return resultFromRun(run);
     } finally {
@@ -256,7 +259,11 @@ export class RunCoordinator {
       await this.runLifecycleOperation(run, "resume", (lifecycle) => this.resume(run, lifecycle));
     }
     const runtime = this.runtimes.get(run.runId);
-    if (!runtime || run.paneState !== "open") throw new Error("Subagent is not connected; resume it first");
+    if (!runtime || run.paneState !== "open") {
+      throw new Error(run.paneState === "disconnected"
+        ? "Subagent terminal target could not be verified closed. Ask the user to close it and resume the run from /subagent."
+        : "Subagent is not connected; resume it first");
+    }
     const previousRun = structuredClone(run);
     const previousSettled = runtime.settled;
     const previousAutoClose = runtime.autoClose;
@@ -289,7 +296,7 @@ export class RunCoordinator {
 
   /** Marks restored settled runs whose results never reached the parent as delivered and returns them. */
   takePendingCompletions(): RunCompletion[] {
-    const pending = [...this.runs.values()].filter((run) => run.completionDelivered === false && !isActive(run.status));
+    const pending = [...this.runs.values()].filter((run) => !run.completionDelivered && !isActive(run.status));
     return pending.map((run) => {
       this.update(run, { completionDelivered: true });
       return completionFromRun(run);
@@ -637,7 +644,7 @@ export class RunCoordinator {
   }
 
   private deliverCompletion(run: RunRecord): void {
-    if (run.completionDelivered !== false) return;
+    if (run.completionDelivered) return;
     this.update(run, { completionDelivered: true });
     this.dependencies.notifyCompletion(completionFromRun(run));
   }
@@ -656,7 +663,7 @@ export class RunCoordinator {
       paneState: paneResult.paneState,
       completedAt: this.now(),
       error: combineErrors(errorMessage(error), paneResult.error),
-      // The failure is returned by start(), so it must not be delivered again on the next session start.
+      // start() returns this failure, so it must not be delivered again on the next session start.
       completionDelivered: true,
     });
     this.runtimes.delete(run.runId);

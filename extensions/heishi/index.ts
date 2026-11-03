@@ -15,6 +15,8 @@ import {
   Markdown,
   Spacer,
   Text,
+  truncateToWidth,
+  type Component,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { WorktreeCleanupApproval } from "./cleanup.js";
@@ -29,6 +31,7 @@ import {
 } from "./model-config.js";
 import { showSubagentOverlay } from "./overlay.js";
 import {
+  parseRunCompletion,
   reconcileRuns,
   restoreRunSnapshots,
   RUN_ENTRY_TYPE,
@@ -193,7 +196,7 @@ export default function heishi(pi: ExtensionAPI): void {
       const task = typeof args.task === "string" ? args.task : "";
       const mode = args.mode ? ` · ${args.mode}` : "";
       const workspace = args.workspace ? ` · ${args.workspace}` : "";
-      const model = args.model || args.thinking ? ` · ${args.model ?? "default"} / ${args.thinking ?? "default"}` : "";
+      const model = args.model !== undefined || args.thinking !== undefined ? ` · ${args.model ?? "default"} / ${args.thinking ?? "default"}` : "";
       container.addChild(new Text(
         `${theme.fg("accent", "◐")} ${theme.fg("toolTitle", theme.bold("subagent_start"))}  ${theme.fg("accent", alias)}${theme.fg("dim", `${mode}${workspace}${model}`)}`,
         0,
@@ -248,9 +251,10 @@ export default function heishi(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerMessageRenderer<RunCompletion>(COMPLETION_MESSAGE_TYPE, (message, { expanded, outputPad }, theme) => {
-    const details = message.details;
-    return details ? renderCompletion(details, expanded, outputPad, theme) : undefined;
+  pi.registerMessageRenderer(COMPLETION_MESSAGE_TYPE, (message, { expanded, outputPad }, theme) => {
+    // Details are restored from session files, so validate them before rendering.
+    const completion = parseRunCompletion(message.details);
+    return completion ? renderCompletion(completion, expanded, outputPad, theme) : undefined;
   });
 
   pi.on("before_agent_start", (event) => {
@@ -354,27 +358,24 @@ function renderControlRunResult(details: ControlRunResult | undefined, result: R
 }
 
 function renderCompletion(completion: RunCompletion, expanded: boolean, outputPad: number, theme: Theme): Box {
-  const background = completion.status === "completed"
-    ? "toolSuccessBg"
-    : completion.status === "failed"
-      ? "toolErrorBg"
-      : "toolPendingBg";
+  const { color, icon, background } = statusStyle(completion.status);
   const box = new Box(outputPad, 1, (text) => theme.bg(background, text));
-  const { color, icon } = statusStyle(completion.status);
-  box.addChild(new Text(
-    `${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(runIdentity(completion)))}  ${theme.fg(color, completion.status)}${theme.fg("dim", ` · ${formatDuration(completion.durationMs)}`)}`,
-    0,
-    0,
+  box.addChild(new SingleLine(
+    `${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(`${completion.alias} · ${shortRunId(completion.runId)}`))}  ${theme.fg(color, completion.status)}${theme.fg("dim", ` · ${formatDuration(completion.durationMs)}`)}`,
   ));
   const location = runLocation(completion);
-  const metadata = [
+  const metadata = theme.fg("dim", [
+    ...(completion.mode === "main" ? ["main"] : []),
     `${completion.model ?? "default model"} / ${completion.thinking ?? "default thinking"}`,
-    ...(completion.worktree ? [`${displayWorktreePath(completion.worktree.path)} · ${completion.worktree.branch}`] : []),
+    ...(completion.worktree ? [worktreeLabel(completion.worktree)] : []),
     ...(location ? [location] : []),
-  ].join(" · ");
-  box.addChild(new Text(theme.fg("dim", metadata), 0, 0));
-  if (!expanded) return box;
+  ].join(" · "));
+  if (!expanded) {
+    box.addChild(new SingleLine(metadata));
+    return box;
+  }
 
+  box.addChild(new Text(metadata, 0, 0));
   box.addChild(new Text(theme.fg("dim", `Run: ${completion.runId}`), 0, 0));
   if (completion.error) box.addChild(new Text(theme.fg("error", completion.error), 0, 0));
   if (completion.report) {
@@ -384,16 +385,30 @@ function renderCompletion(completion: RunCompletion, expanded: boolean, outputPa
   return box;
 }
 
-function statusStyle(status: RunResult["status"]): { color: "success" | "error" | "warning" | "accent"; icon: string } {
-  const color = status === "completed"
-    ? "success"
-    : status === "failed"
-      ? "error"
-      : status === "blocked" || status === "cancelled"
-        ? "warning"
-        : "accent";
-  const icon = status === "completed" ? "✓" : status === "failed" ? "✕" : status === "running" ? "→" : "!";
-  return { color, icon };
+/** Renders one line truncated to the available width, so collapsed completions never wrap. */
+class SingleLine implements Component {
+  constructor(private readonly text: string) {}
+
+  render(width: number): string[] {
+    return width > 0 ? [truncateToWidth(this.text, width)] : [];
+  }
+
+  invalidate(): void {}
+}
+
+function statusStyle(status: RunResult["status"]): {
+  color: "success" | "error" | "warning" | "accent";
+  icon: string;
+  background: "toolSuccessBg" | "toolErrorBg" | "toolPendingBg";
+} {
+  if (status === "completed") return { color: "success", icon: "✓", background: "toolSuccessBg" };
+  if (status === "failed") return { color: "error", icon: "✕", background: "toolErrorBg" };
+  if (status === "blocked" || status === "cancelled") return { color: "warning", icon: "!", background: "toolPendingBg" };
+  return { color: "accent", icon: status === "running" ? "→" : "!", background: "toolPendingBg" };
+}
+
+function worktreeLabel(worktree: NonNullable<RunResult["worktree"]>): string {
+  return `${displayWorktreePath(worktree.path)} · ${worktree.branch}`;
 }
 
 function runLocation(result: RunResult): string {
@@ -411,7 +426,7 @@ function runStatusHeader(result: RunResult, theme: Theme): string {
   const location = runLocation(result);
   const worktree = result.workspace === "worktree"
     ? `\n  ${theme.fg("dim", result.worktree
-        ? `Worktree: ${displayWorktreePath(result.worktree.path)} · ${result.worktree.branch} · base ${result.worktree.baseCommit} · ${result.worktree.state}`
+        ? `Worktree: ${worktreeLabel(result.worktree)} · base ${result.worktree.baseCommit} · ${result.worktree.state}`
         : "Worktree: not prepared")}`
     : "";
   const metadata = location ? ` · ${location}` : "";
@@ -439,12 +454,7 @@ function controlToolResult(
   };
 }
 
-function completionMessage(completion: RunCompletion): {
-  customType: string;
-  content: string;
-  display: true;
-  details: RunCompletion;
-} {
+function completionMessage(completion: RunCompletion) {
   return {
     customType: COMPLETION_MESSAGE_TYPE,
     content: `Heishi subagent ${completion.alias} (${completion.runId}) settled with status ${completion.status}.\n\n${JSON.stringify(completion, null, 2)}`,
@@ -452,7 +462,3 @@ function completionMessage(completion: RunCompletion): {
     details: completion,
   };
 }
-
-
-
-

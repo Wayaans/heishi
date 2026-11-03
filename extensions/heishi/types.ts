@@ -72,8 +72,8 @@ export interface RunRecord {
   updatedAt: string;
   report?: SubagentReport;
   error?: string;
-  // False while a finished work cycle's result has not reached the parent. Older snapshots omit it.
-  completionDelivered?: boolean;
+  // False while the current work cycle's result has not reached the parent.
+  completionDelivered: boolean;
 }
 
 export interface StartInput {

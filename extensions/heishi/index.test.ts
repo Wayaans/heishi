@@ -596,14 +596,17 @@ describe("Heishi tool prompt metadata", () => {
 
     const collapsed = render(false);
     assert.deepEqual(collapsed, [
-      "✓ Atalanta · 123456 · main  completed · 1m 23s",
-      "openai/model / high · /worktrees/repo-abc/run-id · heishi/run-id · headless · pid 42",
+      "✓ Atalanta · 123456  completed · 1m 23s",
+      "main · openai/model / high · /worktrees/repo-abc/run-id · heishi/run-id · headless · pid 42",
     ]);
     assert.equal(backgrounds.includes("toolSuccessBg"), true);
+    const narrow = (renderer(message, { expanded: false, outputPad: 0 }, theme)?.render(40) ?? []).filter((line) => line.trim());
+    assert.equal(narrow.length, 2);
 
     const expanded = render(true).join("\n");
     assert.match(expanded, /Run: 12345678-1234-1234-1234-123456789abc/u);
     assert.match(expanded, /Implemented the change\./u);
+    assert.equal(renderer({ ...message, details: { alias: "Atalanta" } }, { expanded: false, outputPad: 0 }, theme), undefined);
   });
 
   it("delivers restored undelivered completions once without starting a turn", async () => {
@@ -825,6 +828,7 @@ function cleanupFixture(options: {
     placement: "window",
     status: "completed",
     paneState: "closed",
+    completionDelivered: true,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:01:00.000Z",
     ...options.run,
@@ -891,6 +895,3 @@ function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
   assert.ok(tool, `Expected ${name} to be registered`);
   return tool;
 }
-
-
-

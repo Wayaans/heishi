@@ -15,6 +15,7 @@ class FakeChannel implements WorkerChannel {
   readonly readinessTimeouts: Array<number | undefined> = [];
   closed = false;
   sendGate?: Promise<void>;
+  sendError?: Error;
   readyGate?: Promise<void>;
 
   constructor(readonly ready: WorkerReady) {}
@@ -26,6 +27,7 @@ class FakeChannel implements WorkerChannel {
   async send(type: string, payload?: Record<string, unknown>): Promise<void> {
     this.sent.push(payload === undefined ? { type } : { type, payload });
     await this.sendGate;
+    if (this.sendError) throw this.sendError;
   }
   async close(): Promise<void> { this.closed = true; }
 }
@@ -250,6 +252,7 @@ function completedRun(): RunRecord {
     paneState: "closed",
     workerSessionId: "session-1",
     workerSessionFile: "/sessions/session-1.jsonl",
+    completionDelivered: true,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:01:00.000Z",
   };
@@ -828,6 +831,33 @@ Inspect the repository`,
     assert.deepEqual(completions.map((completion) => completion.report?.summary), ["Fast"]);
     assert.equal(coordinator.list()[0]?.status, "completed");
     assert.deepEqual(coordinator.takePendingCompletions(), []);
+  });
+
+  it("keeps a delivered result when the task send fails after the worker settled", async () => {
+    const { coordinator, ipc, completions } = fixture();
+    let releaseSend!: () => void;
+    ipc.channel.sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    ipc.channel.sendError = new Error("Subagent is not connected");
+
+    const starting = coordinator.start({ task: "Inspect" });
+    while (ipc.channel.sent.length === 0) await pause();
+    await ipc.emit({ type: "settled", runId: "12345678-1234-1234-1234-123456789abc", version: 1, finalText: "Fast" });
+    releaseSend();
+    const started = await starting;
+
+    assert.equal(started.status, "completed");
+    assert.equal(started.error, undefined);
+    assert.deepEqual(completions.map((completion) => completion.status), ["completed"]);
+  });
+
+  it("explains that a disconnected worker needs the user before it can be prompted", async () => {
+    const { coordinator } = fixture();
+    coordinator.restore([{ ...completedRun(), paneState: "disconnected", hostTarget: { host: "tmux", paneId: "%9" } }]);
+
+    await assert.rejects(
+      () => coordinator.control({ runId: "run-1", action: "prompt", message: "More" }),
+      /could not be verified closed.*\/subagent/u,
+    );
   });
 
   it("does not redeliver a startup failure already returned by start", async () => {
